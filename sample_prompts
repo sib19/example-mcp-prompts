@@ -1,0 +1,357 @@
+# FastMCP Prompt Methods - Complete Guide
+
+## 📖 What Are Prompt Methods?
+
+Prompt methods in FastMCP are special functions decorated with `@mcp.prompt()` that teach the LLM:
+- **WHEN** to use each tool
+- **HOW** to extract parameters from natural language
+- **WHAT** patterns to follow for specific queries
+- **HOW** to handle errors and edge cases
+
+Think of them as "training examples" that make the LLM smarter about using your tools.
+
+---
+
+## 🎯 6 Prompt Patterns
+
+### Pattern 1: System Instructions (String Return)
+
+**Use For:** Overall behavior, rules, guidelines
+
+```python
+@mcp.prompt()
+def my_system_prompt() -> str:
+    """Main instructions for the assistant"""
+    return """You are a helpful assistant with these capabilities:
+
+TOOLS AVAILABLE:
+1. get_data(symbol) - Retrieves data for a symbol
+2. list_symbols() - Lists all available symbols
+
+WHEN TO USE TOOLS:
+✅ Use get_data when user asks: "Get data for X", "Show me X"
+✅ Use list_symbols when user asks: "What's available?", "List symbols"
+
+RULES:
+- Always uppercase symbols
+- If symbol not found, suggest list_symbols
+- Format responses clearly
+"""
+```
+
+**Why This Works:**
+- Sets overall context for the LLM
+- Establishes rules and capabilities
+- Provides clear decision criteria
+
+---
+
+### Pattern 2: Few-Shot Examples (Message List Return)
+
+**Use For:** Teaching exact function calling patterns
+
+```python
+@mcp.prompt()
+def example_basic_query() -> List[Dict[str, str]]:
+    """Shows the exact pattern for basic queries"""
+    return [
+        {
+            "role": "user",
+            "content": "Get data for AAPL"
+        },
+        {
+            "role": "assistant",
+            "content": """I'll retrieve data for AAPL.
+
+Calling get_data(symbol="AAPL")..."""
+        }
+    ]
+```
+
+**Why This Works:**
+- Shows concrete input → output mapping
+- LLM learns by mimicking the pattern
+- Demonstrates parameter extraction
+
+**Key Components:**
+- `role: "user"` - What user says
+- `role: "assistant"` - How to respond
+- Clear parameter extraction logic
+
+---
+
+### Pattern 3: Multi-Turn Examples (Complex Interactions)
+
+**Use For:** Error handling, follow-ups, chained operations
+
+```python
+@mcp.prompt()
+def example_error_recovery() -> List[Dict[str, str]]:
+    """Shows how to handle errors gracefully"""
+    return [
+        {
+            "role": "user",
+            "content": "Get data for XYZ"
+        },
+        {
+            "role": "assistant",
+            "content": "Checking for XYZ data..."
+        },
+        {
+            "role": "assistant",
+            "content": """No data found for XYZ.
+
+Let me show available symbols..."""
+        },
+        {
+            "role": "assistant",
+            "content": """Available symbols: AAPL, GOOGL, MSFT
+
+Would you like data for one of these?"""
+        }
+    ]
+```
+
+**Why This Works:**
+- Shows complete conversation flow
+- Demonstrates recovery strategies
+- Teaches graceful degradation
+
+---
+
+### Pattern 4: Parameterized Prompts (Dynamic Examples)
+
+**Use For:** Generating context-specific examples
+
+```python
+@mcp.prompt()
+def query_template_for_symbol(symbol: str) -> str:
+    """Creates custom example for specific symbol"""
+    return f"""For {symbol} queries, follow this pattern:
+
+User says: "Get {symbol} data"
+Extract: symbol = "{symbol}"
+Call: get_data(symbol="{symbol}")
+
+Example variations:
+- "Show me {symbol}" → get_data("{symbol}")
+- "Recent {symbol} trades" → get_data("{symbol}", limit=10)
+"""
+```
+
+**Why This Works:**
+- Adapts to runtime context
+- Provides symbol-specific guidance
+- Can generate many examples from template
+
+---
+
+### Pattern 5: Conditional Prompts (Context-Aware)
+
+**Use For:** Different behavior based on state/context
+
+```python
+@mcp.prompt()
+def context_aware_prompt(is_production: bool = False) -> str:
+    """Adjusts behavior based on environment"""
+    if is_production:
+        return """⚠️ PRODUCTION MODE
+
+- Double-check all parameters
+- Use conservative limits
+- Log all operations
+- Confirm destructive actions
+"""
+    else:
+        return """🔧 DEVELOPMENT MODE
+
+- More lenient with errors
+- Can use test data
+- Verbose logging enabled
+"""
+```
+
+**Why This Works:**
+- Adapts to runtime conditions
+- Different rules for different contexts
+- Environment-aware behavior
+
+---
+
+### Pattern 6: Metadata-Rich Prompts (Structured)
+
+**Use For:** Complex examples with additional context
+
+```python
+@mcp.prompt()
+def structured_example() -> Dict[str, Any]:
+    """Example with metadata"""
+    return {
+        "name": "complete_workflow",
+        "description": "Full query workflow",
+        "messages": [
+            {
+                "role": "user",
+                "content": "Analyze AAPL"
+            },
+            {
+                "role": "assistant",
+                "content": "Step 1: Getting data..."
+            },
+            {
+                "role": "assistant",
+                "content": "Step 2: Calculating metrics..."
+            }
+        ],
+        "tags": ["analysis", "multi-step"],
+        "difficulty": "intermediate"
+    }
+```
+
+**Why This Works:**
+- Provides additional context
+- Can be categorized/searched
+- Supports complex workflows
+
+---
+
+## 🔑 Key Principles for Writing Good Prompts
+
+### 1. **Be Explicit and Specific**
+
+❌ Bad:
+```python
+return "Use get_data for queries"
+```
+
+✅ Good:
+```python
+return """Use get_data when user says:
+- "Get data for AAPL"
+- "Show me GOOGL"
+- "Retrieve MSFT info"
+
+Extract the symbol (AAPL, GOOGL, MSFT) and call:
+get_data(symbol=<extracted_symbol>)
+"""
+```
+
+### 2. **Show, Don't Just Tell**
+
+❌ Bad:
+```python
+return "Extract dates from user queries"
+```
+
+✅ Good:
+```python
+return [
+    {"role": "user", "content": "Get data from Jan 15 to Jan 20"},
+    {"role": "assistant", "content": """Extracting dates:
+- "Jan 15" → "2024-01-15"
+- "Jan 20" → "2024-01-20"
+
+Calling get_data(start="2024-01-15", end="2024-01-20")"""}
+]
+```
+
+### 3. **Handle Edge Cases**
+
+```python
+@mcp.prompt()
+def edge_case_handling() -> str:
+    return """EDGE CASES:
+
+1. Empty Results:
+   - Call list_symbols() to show alternatives
+   
+2. Ambiguous Query:
+   - Ask clarifying question
+   
+3. Invalid Format:
+   - Provide example of correct format
+   
+4. Multiple Matches:
+   - Show all options and ask user to choose
+"""
+```
+
+### 4. **Use Clear Examples**
+
+```python
+@mcp.prompt()
+def clear_examples() -> List[Dict[str, str]]:
+    """Multiple examples for same pattern"""
+    return [
+        # Example 1: Basic
+        {"role": "user", "content": "Get AAPL"},
+        {"role": "assistant", "content": "get_data('AAPL')"},
+        
+        # Example 2: With date
+        {"role": "user", "content": "Get AAPL from Jan 15"},
+        {"role": "assistant", "content": "get_data('AAPL', start='2024-01-15')"},
+        
+        # Example 3: With filter
+        {"role": "user", "content": "Get AAPL buy trades"},
+        {"role": "assistant", "content": "get_data('AAPL', type='BUY')"}
+    ]
+```
+
+---
+
+## 🎬 Complete Working Example
+
+Here's how all patterns work together:
+
+```python
+from fastmcp import FastMCP
+from typing import List, Dict
+
+mcp = FastMCP("My Server")
+
+# Tool definition
+@mcp.tool()
+def get_data(symbol: str, days: int = 7) -> dict:
+    """Get data for symbol"""
+    return {"symbol": symbol, "days": days}
+
+# Pattern 1: System prompt
+@mcp.prompt()
+def system() -> str:
+    return """You help users get stock data.
+
+TOOL: get_data(symbol, days)
+
+USE WHEN: User asks for stock data
+EXTRACT: Symbol from query
+DEFAULT: days=7 unless specified
+"""
+
+# Pattern 2: Basic example
+@mcp.prompt()
+def example_basic() -> List[Dict[str, str]]:
+    return [
+        {"role": "user", "content": "Get AAPL data"},
+        {"role": "assistant", "content": "get_data('AAPL')"}
+    ]
+
+# Pattern 3: Date example
+@mcp.prompt()
+def example_with_days() -> List[Dict[str, str]]:
+    return [
+        {"role": "user", "content": "Get AAPL data for last 30 days"},
+        {"role": "assistant", "content": "get_data('AAPL', days=30)"}
+    ]
+
+# Pattern 4: Dynamic example
+@mcp.prompt()
+def template(symbol: str) -> str:
+    return f"For {symbol}: get_data('{symbol}')"
+
+# Pattern 5: Error handling
+@mcp.prompt()
+def errors() -> str:
+    return """If symbol not found: Ask user to check spelling"""
+
+if __name__ == "__main__":
+    mcp.run()
