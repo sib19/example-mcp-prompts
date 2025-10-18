@@ -1,0 +1,806 @@
+"""
+KDB+ FastMCP Server with Dynamic Function Calling
+Complete implementation with schema introspection and intelligent prompts
+"""
+
+from fastmcp import FastMCP
+from typing import Dict, List, Any, Optional
+import qpython.qconnection as qconnection
+from qpython import MetaData
+import json
+from datetime import datetime, timedelta
+
+# Initialize FastMCP server
+mcp = FastMCP("KDB+ Database Server")
+
+# KDB+ connection configuration
+KDB_HOST = 'localhost'
+KDB_PORT = 5000
+KDB_USERNAME = 'username'
+KDB_PASSWORD = 'password'
+
+# Global connection (or create per request)
+def get_kdb_connection():
+    """Create KDB+ connection"""
+    try:
+        q = qconnection.QConnection(
+            host=KDB_HOST, 
+            port=KDB_PORT,
+            username=KDB_USERNAME,
+            password=KDB_PASSWORD
+        )
+        q.open()
+        return q
+    except Exception as e:
+        raise Exception(f"Failed to connect to KDB+: {str(e)}")
+
+# ============================================================================
+# SCHEMA INTROSPECTION TOOLS
+# ============================================================================
+
+@mcp.tool()
+def list_tables() -> List[str]:
+    """
+    List all tables available in the KDB+ database.
+    
+    Returns:
+        List of table names as strings
+        
+    Example:
+        ["trades", "quotes", "orders", "executions"]
+    """
+    q = get_kdb_connection()
+    try:
+        # Query to get all tables in default namespace
+        result = q.sync('tables[]')
+        tables = [t.decode() if isinstance(t, bytes) else str(t) for t in result]
+        return tables
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        q.close()
+
+
+@mcp.tool()
+def describe_table(table_name: str) -> Dict[str, Any]:
+    """
+    Get detailed schema information for a specific table.
+    
+    Args:
+        table_name: Name of the table to describe
+        
+    Returns:
+        Dictionary containing:
+        - columns: List of column names
+        - types: List of column types
+        - sample_count: Number of rows in table
+        - meta: Full metadata dictionary
+        
+    Example:
+        describe_table("trades") returns:
+        {
+            "table": "trades",
+            "columns": ["time", "sym", "price", "size"],
+            "types": ["timestamp", "symbol", "float", "long"],
+            "sample_count": 1000000,
+            "meta": {...}
+        }
+    """
+    q = get_kdb_connection()
+    try:
+        # Get table metadata
+        meta_query = f'meta {table_name}'
+        meta_result = q.sync(meta_query)
+        
+        # Get row count
+        count_query = f'count {table_name}'
+        count = q.sync(count_query)
+        
+        # Extract column info
+        columns = []
+        types = []
+        
+        if hasattr(meta_result, 'dtype'):
+            # Meta result is a structured array
+            columns = list(meta_result.dtype.names) if meta_result.dtype.names else []
+            types = [str(meta_result[col].dtype) for col in columns] if columns else []
+        
+        return {
+            "table": table_name,
+            "columns": columns,
+            "types": types,
+            "sample_count": int(count),
+            "meta": str(meta_result)
+        }
+    except Exception as e:
+        return {"error": f"Failed to describe table {table_name}: {str(e)}"}
+    finally:
+        q.close()
+
+
+@mcp.tool()
+def list_functions() -> List[Dict[str, Any]]:
+    """
+    List all available KDB+ functions in the database.
+    
+    Returns:
+        List of dictionaries containing function information:
+        - name: Function name
+        - namespace: Function namespace (. for default)
+        - type: Function type
+        
+    Example:
+        [
+            {"name": "getTradeData", "namespace": ".", "type": "function"},
+            {"name": "getQuoteData", "namespace": ".", "type": "function"}
+        ]
+    """
+    q = get_kdb_connection()
+    try:
+        # Get all functions in default namespace
+        result = q.sync('key `.') 
+        
+        functions = []
+        for item in result:
+            item_str = item.decode() if isinstance(item, bytes) else str(item)
+            # Check if it's a function
+            try:
+                func_type = q.sync(f'type {item_str}')
+                if func_type == 100:  # 100 is function type in KDB+
+                    functions.append({
+                        "name": item_str,
+                        "namespace": ".",
+                        "type": "function"
+                    })
+            except:
+                pass
+        
+        return functions
+    except Exception as e:
+        return [{"error": str(e)}]
+    finally:
+        q.close()
+
+
+@mcp.tool()
+def get_function_signature(function_name: str) -> Dict[str, Any]:
+    """
+    Get the signature and definition of a KDB+ function.
+    
+    Args:
+        function_name: Name of the function
+        
+    Returns:
+        Dictionary containing:
+        - name: Function name
+        - definition: Function definition code
+        - parameters: Extracted parameter names (if available)
+        
+    Example:
+        get_function_signature("getTradeData") returns:
+        {
+            "name": "getTradeData",
+            "definition": "{[sym;startDate;endDate] ...}",
+            "parameters": ["sym", "startDate", "endDate"]
+        }
+    """
+    q = get_kdb_connection()
+    try:
+        # Get function definition
+        definition = q.sync(f'{function_name}')
+        definition_str = str(definition)
+        
+        # Try to extract parameters
+        parameters = []
+        if '[' in definition_str and ']' in definition_str:
+            param_section = definition_str[definition_str.find('[')+1:definition_str.find(']')]
+            parameters = [p.strip() for p in param_section.split(';')]
+        
+        return {
+            "name": function_name,
+            "definition": definition_str,
+            "parameters": parameters
+        }
+    except Exception as e:
+        return {"error": f"Failed to get signature for {function_name}: {str(e)}"}
+    finally:
+        q.close()
+
+
+# ============================================================================
+# DYNAMIC FUNCTION CALLER - THE CORE FEATURE
+# ============================================================================
+
+@mcp.tool()
+def call_kdb_function(
+    function_name: str,
+    symbol: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: Optional[int] = None,
+    **kwargs
+) -> Dict[str, Any]:
+    """
+    Dynamically call any KDB+ function with flexible parameters.
+    
+    This is the MAIN tool for executing KDB+ functions dynamically.
+    
+    Args:
+        function_name: Name of the KDB+ function to call (e.g., 'getTradeData')
+        symbol: Optional stock symbol (e.g., 'AAPL', 'GOOGL')
+        start_date: Optional start date in YYYY.MM.DD format (KDB+ date format)
+        end_date: Optional end date in YYYY.MM.DD format
+        limit: Optional limit on number of results
+        **kwargs: Additional function-specific parameters
+        
+    Returns:
+        Dictionary containing:
+        - function: Name of called function
+        - parameters: Parameters passed
+        - result: Query results
+        - row_count: Number of rows returned
+        
+    Examples:
+        # Get trade data for AAPL
+        call_kdb_function("getTradeData", symbol="AAPL")
+        
+        # Get trades with date range
+        call_kdb_function("getTradeData", symbol="GOOGL", 
+                         start_date="2024.01.15", end_date="2024.01.20")
+        
+        # Get quote data
+        call_kdb_function("getQuoteData", symbol="MSFT", limit=100)
+        
+        # Custom function with extra params
+        call_kdb_function("customAnalysis", symbol="AAPL", 
+                         param1="value1", param2=42)
+    """
+    q = get_kdb_connection()
+    try:
+        # Build parameter list based on what's provided
+        params = []
+        param_values = {}
+        
+        if symbol:
+            params.append(f'`${symbol}')  # Symbol in KDB+ format
+            param_values['symbol'] = symbol
+            
+        if start_date:
+            params.append(f'{start_date}')  # Date in KDB+ format
+            param_values['start_date'] = start_date
+            
+        if end_date:
+            params.append(f'{end_date}')
+            param_values['end_date'] = end_date
+            
+        if limit:
+            params.append(str(limit))
+            param_values['limit'] = limit
+        
+        # Add any additional kwargs
+        for key, value in kwargs.items():
+            if isinstance(value, str):
+                params.append(f'`{value}')
+            else:
+                params.append(str(value))
+            param_values[key] = value
+        
+        # Build the KDB+ query
+        if params:
+            query = f'{function_name}[{";".join(params)}]'
+        else:
+            query = f'{function_name}[]'
+        
+        # Execute the query
+        result = q.sync(query)
+        
+        # Convert result to JSON-serializable format
+        result_data = convert_kdb_result(result)
+        
+        return {
+            "function": function_name,
+            "parameters": param_values,
+            "query": query,
+            "result": result_data,
+            "row_count": len(result_data) if isinstance(result_data, list) else 1
+        }
+        
+    except Exception as e:
+        return {
+            "function": function_name,
+            "parameters": param_values if 'param_values' in locals() else {},
+            "error": str(e)
+        }
+    finally:
+        q.close()
+
+
+@mcp.tool()
+def execute_kdb_query(query: str) -> Dict[str, Any]:
+    """
+    Execute raw KDB+ query directly.
+    
+    USE WITH CAUTION: Only for advanced users who know KDB+ q language.
+    
+    Args:
+        query: Raw KDB+ q query string
+        
+    Returns:
+        Dictionary containing query results
+        
+    Example:
+        execute_kdb_query("select from trades where sym=`AAPL")
+    """
+    q = get_kdb_connection()
+    try:
+        result = q.sync(query)
+        result_data = convert_kdb_result(result)
+        
+        return {
+            "query": query,
+            "result": result_data,
+            "row_count": len(result_data) if isinstance(result_data, list) else 1
+        }
+    except Exception as e:
+        return {
+            "query": query,
+            "error": str(e)
+        }
+    finally:
+        q.close()
+
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def convert_kdb_result(result) -> Any:
+    """Convert KDB+ result to JSON-serializable format"""
+    if result is None:
+        return None
+    
+    # Handle numpy arrays and structured arrays
+    if hasattr(result, 'dtype'):
+        if result.dtype.names:  # Structured array (table)
+            records = []
+            for row in result:
+                record = {}
+                for col in result.dtype.names:
+                    value = row[col]
+                    # Convert types
+                    if hasattr(value, 'item'):
+                        value = value.item()
+                    if isinstance(value, bytes):
+                        value = value.decode()
+                    record[col] = value
+                records.append(record)
+            return records
+        else:  # Simple array
+            return result.tolist()
+    
+    # Handle lists
+    if isinstance(result, (list, tuple)):
+        return [convert_kdb_result(item) for item in result]
+    
+    # Handle bytes
+    if isinstance(result, bytes):
+        return result.decode()
+    
+    # Handle basic types
+    return result
+
+
+# ============================================================================
+# COMPREHENSIVE PROMPTS FOR LLM
+# ============================================================================
+
+@mcp.prompt()
+def kdb_assistant_system() -> str:
+    """
+    Main system prompt teaching LLM about KDB+ database operations.
+    """
+    return """You are a KDB+ Database Assistant with access to a KDB+ time-series database.
+
+🎯 YOUR CAPABILITIES:
+
+You have access to these tools:
+
+1. SCHEMA DISCOVERY:
+   - list_tables() → See all available tables
+   - describe_table(table_name) → Get table structure and columns
+   - list_functions() → See all KDB+ functions available
+   - get_function_signature(function_name) → See function definition
+
+2. DYNAMIC FUNCTION CALLING (PRIMARY TOOL):
+   - call_kdb_function(function_name, symbol, start_date, end_date, limit, **kwargs)
+     * This is your MAIN tool for getting data
+     * Dynamically calls ANY KDB+ function
+     * Flexible parameters based on function needs
+
+3. RAW QUERY (ADVANCED):
+   - execute_kdb_query(query) → Execute raw KDB+ q queries
+
+📋 WHEN TO USE EACH TOOL:
+
+✅ ALWAYS START WITH DISCOVERY when user query is unclear:
+   1. Call list_tables() to see what data is available
+   2. Call list_functions() to see what operations are available
+   3. Call describe_table() to understand table structure
+
+✅ USE call_kdb_function() for ALL data queries:
+   - "Get trade data for AAPL" → call_kdb_function("getTradeData", symbol="AAPL")
+   - "Show GOOGL quotes" → call_kdb_function("getQuoteData", symbol="GOOGL")
+   - "Get MSFT trades from Jan 15 to Jan 20" → 
+     call_kdb_function("getTradeData", symbol="MSFT", 
+                      start_date="2024.01.15", end_date="2024.01.20")
+
+✅ USE execute_kdb_query() ONLY when:
+   - User explicitly provides a KDB+ query
+   - You need custom aggregations not available in functions
+   - User asks for raw query execution
+
+🔧 PARAMETER EXTRACTION RULES:
+
+SYMBOL:
+  - Extract: AAPL, GOOGL, MSFT, etc.
+  - Always uppercase
+  - Pass as: symbol="AAPL"
+
+DATES:
+  - KDB+ format: YYYY.MM.DD (dots, not dashes!)
+  - "January 15, 2024" → "2024.01.15"
+  - "Jan 15" → "2024.01.15" (assume current year)
+  - "today" → today's date in YYYY.MM.DD
+  - "last week" → 7 days ago
+  - Pass as: start_date="2024.01.15", end_date="2024.01.20"
+
+LIMIT:
+  - Extract number: "last 100", "top 50"
+  - Pass as: limit=100
+
+FUNCTION NAMES:
+  - Common functions: getTradeData, getQuoteData, getOrderData
+  - If unsure, call list_functions() first
+  - Case-sensitive!
+
+⚠️ CRITICAL RULES:
+
+1. **Date Format**: ALWAYS use YYYY.MM.DD with DOTS (2024.01.15)
+2. **Symbol Format**: Uppercase, no special characters
+3. **Discover First**: When unsure, use list_functions() or describe_table()
+4. **Function Names**: Case-sensitive, check exact name with list_functions()
+5. **Dynamic Calling**: You can call ANY function, even ones added in the future
+6. **Error Handling**: If function fails, try listing functions to verify name
+
+💡 RESPONSE FORMAT:
+
+When presenting data:
+- Show summary first (e.g., "Retrieved 150 trades for AAPL")
+- Format tables clearly
+- Highlight key metrics
+- Mention data range if dates used
+- Suggest related queries
+
+🔄 WORKFLOW PATTERN:
+
+For new queries:
+1. Identify what user wants (trade data, quotes, etc.)
+2. If function name unclear → call list_functions()
+3. Extract parameters (symbol, dates, etc.)
+4. Call call_kdb_function() with appropriate parameters
+5. Present results clearly
+
+Example workflow:
+User: "Get Apple trade data from last week"
+You: 
+  1. Identify: trade data needed
+  2. Function: "getTradeData" (or check list_functions if unsure)
+  3. Extract: symbol="AAPL", start_date=<7 days ago>
+  4. Call: call_kdb_function("getTradeData", symbol="AAPL", start_date="2024.01.11")
+  5. Present: "Retrieved 1,234 trades for AAPL from 2024.01.11..."
+"""
+
+
+@mcp.prompt()
+def example_basic_function_call() -> List[Dict[str, str]]:
+    """
+    Basic example: Simple function call with symbol.
+    """
+    return [
+        {
+            "role": "user",
+            "content": "Get trade data for AAPL"
+        },
+        {
+            "role": "assistant",
+            "content": """I'll retrieve trade data for AAPL using the getTradeData function.
+
+Parameters:
+- function_name: "getTradeData"
+- symbol: "AAPL"
+
+Calling call_kdb_function("getTradeData", symbol="AAPL")..."""
+        }
+    ]
+
+
+@mcp.prompt()
+def example_function_with_dates() -> List[Dict[str, str]]:
+    """
+    Example: Function call with date range.
+    
+    IMPORTANT: Shows KDB+ date format with DOTS.
+    """
+    return [
+        {
+            "role": "user",
+            "content": "Show me GOOGL trades from January 15 to January 20, 2024"
+        },
+        {
+            "role": "assistant",
+            "content": """I'll fetch GOOGL trades for the specified date range.
+
+Extracting parameters:
+- function_name: "getTradeData"
+- symbol: "GOOGL"
+- start_date: "2024.01.15" (note: KDB+ uses dots, not dashes!)
+- end_date: "2024.01.20"
+
+Calling call_kdb_function("getTradeData", symbol="GOOGL", 
+                         start_date="2024.01.15", end_date="2024.01.20")..."""
+        }
+    ]
+
+
+@mcp.prompt()
+def example_discover_then_call() -> List[Dict[str, str]]:
+    """
+    Example: Discover available functions first, then call.
+    """
+    return [
+        {
+            "role": "user",
+            "content": "What data can I get for MSFT?"
+        },
+        {
+            "role": "assistant",
+            "content": "Let me first check what functions are available..."
+        },
+        {
+            "role": "assistant",
+            "content": """Calling list_functions() to see available operations..."""
+        },
+        {
+            "role": "assistant",
+            "content": """Found these functions:
+- getTradeData: Retrieve trade data
+- getQuoteData: Retrieve quote data
+- getOrderData: Retrieve order data
+
+Would you like trade data, quote data, or order data for MSFT?"""
+        },
+        {
+            "role": "user",
+            "content": "Trade data please"
+        },
+        {
+            "role": "assistant",
+            "content": """Calling call_kdb_function("getTradeData", symbol="MSFT")..."""
+        }
+    ]
+
+
+@mcp.prompt()
+def example_function_with_limit() -> List[Dict[str, str]]:
+    """
+    Example: Function call with limit parameter.
+    """
+    return [
+        {
+            "role": "user",
+            "content": "Get the last 50 trades for AAPL"
+        },
+        {
+            "role": "assistant",
+            "content": """I'll retrieve the 50 most recent AAPL trades.
+
+Parameters:
+- function_name: "getTradeData"
+- symbol: "AAPL"
+- limit: 50
+
+Calling call_kdb_function("getTradeData", symbol="AAPL", limit=50)..."""
+        }
+    ]
+
+
+@mcp.prompt()
+def example_unknown_function() -> List[Dict[str, str]]:
+    """
+    Example: Handle unknown function name.
+    """
+    return [
+        {
+            "role": "user",
+            "content": "Get execution data for GOOGL"
+        },
+        {
+            "role": "assistant",
+            "content": """I'm not sure of the exact function name for execution data.
+Let me check available functions..."""
+        },
+        {
+            "role": "assistant",
+            "content": """Calling list_functions()..."""
+        },
+        {
+            "role": "assistant",
+            "content": """Found: getExecutionData function!
+
+Now calling call_kdb_function("getExecutionData", symbol="GOOGL")..."""
+        }
+    ]
+
+
+@mcp.prompt()
+def example_table_discovery() -> List[Dict[str, str]]:
+    """
+    Example: Discover table structure before querying.
+    """
+    return [
+        {
+            "role": "user",
+            "content": "What columns are in the trades table?"
+        },
+        {
+            "role": "assistant",
+            "content": """I'll get the schema for the trades table.
+
+Calling describe_table("trades")..."""
+        },
+        {
+            "role": "assistant",
+            "content": """The trades table has these columns:
+- time: timestamp
+- sym: symbol
+- price: float
+- size: long
+- exchange: symbol
+
+This table contains 5.2M rows."""
+        }
+    ]
+
+
+@mcp.prompt()
+def example_custom_function_params() -> List[Dict[str, str]]:
+    """
+    Example: Call function with custom parameters.
+    """
+    return [
+        {
+            "role": "user",
+            "content": "Run the aggregateTradeVolume function for AAPL with interval 5 minutes"
+        },
+        {
+            "role": "assistant",
+            "content": """I'll call the custom aggregation function with your parameters.
+
+Parameters:
+- function_name: "aggregateTradeVolume"
+- symbol: "AAPL"
+- interval: "5m" (custom parameter)
+
+Calling call_kdb_function("aggregateTradeVolume", symbol="AAPL", interval="5m")...
+
+Note: Using **kwargs to pass custom parameter 'interval'."""
+        }
+    ]
+
+
+@mcp.prompt()
+def kdb_date_format_guide() -> str:
+    """
+    Critical guide for KDB+ date formatting.
+    """
+    return """🗓️ KDB+ DATE FORMAT GUIDE - CRITICAL!
+
+KDB+ uses a UNIQUE date format: YYYY.MM.DD (with DOTS!)
+
+CONVERSION RULES:
+
+"January 15, 2024" → "2024.01.15"
+"Jan 15" → "2024.01.15"
+"2024-01-15" → "2024.01.15" (change dashes to dots!)
+"01/15/2024" → "2024.01.15"
+"today" → current date as "2024.01.18"
+"yesterday" → "2024.01.17"
+"last week" → 7 days ago as "2024.01.11"
+
+ALWAYS USE DOTS, NOT DASHES OR SLASHES!
+
+Examples:
+✅ Correct: start_date="2024.01.15"
+❌ Wrong: start_date="2024-01-15"
+❌ Wrong: start_date="01/15/2024"
+
+When calling functions with dates:
+call_kdb_function("getTradeData", 
+                 symbol="AAPL",
+                 start_date="2024.01.15",  # DOTS!
+                 end_date="2024.01.20")     # DOTS!
+"""
+
+
+@mcp.prompt()
+def dynamic_function_calling_guide() -> str:
+    """
+    Guide for understanding dynamic function calling.
+    """
+    return """🚀 DYNAMIC FUNCTION CALLING - HOW IT WORKS
+
+The call_kdb_function() tool can call ANY function in the KDB+ database,
+even functions that don't exist yet or that you haven't seen before!
+
+HOW TO USE IT:
+
+1. IDENTIFY THE FUNCTION:
+   - Use list_functions() to see what's available
+   - User might tell you the function name directly
+   - Common patterns: getXxxData, fetchXxx, calculateXxx
+
+2. IDENTIFY THE PARAMETERS:
+   - Most functions take: symbol, dates, limit
+   - Custom functions might need other params
+   - Use get_function_signature() to see what function expects
+
+3. CALL THE FUNCTION:
+   - Standard params: symbol, start_date, end_date, limit
+   - Custom params: Use **kwargs for anything else
+   
+   call_kdb_function(
+       "yourFunction",
+       symbol="AAPL",           # Standard
+       start_date="2024.01.15", # Standard
+       custom_param="value",    # Custom via **kwargs
+       another_param=42         # Custom via **kwargs
+   )
+
+FUTURE-PROOF:
+When new functions are added to KDB+, you can call them immediately!
+Just use list_functions() to discover them and call_kdb_function() to use them.
+
+EXAMPLES OF DYNAMIC CALLING:
+
+# Today's function
+call_kdb_function("getTradeData", symbol="AAPL")
+
+# Future function (automatically works when added)
+call_kdb_function("getNewAnalytics", symbol="AAPL", metric="volatility")
+
+# Custom function with special params
+call_kdb_function("customReport", symbol="GOOGL", format="json", detail="high")
+"""
+
+
+if __name__ == "__main__":
+    print("🚀 KDB+ FastMCP Server Starting...")
+    print("\n📊 Available Tools:")
+    print("  Schema Discovery:")
+    print("    - list_tables()")
+    print("    - describe_table(table_name)")
+    print("    - list_functions()")
+    print("    - get_function_signature(function_name)")
+    print("  Data Access:")
+    print("    - call_kdb_function() [MAIN TOOL - Dynamic]")
+    print("    - execute_kdb_query() [Advanced]")
+    print("\n📚 Prompts Loaded:")
+    print("    - kdb_assistant_system (main instructions)")
+    print("    - example_basic_function_call")
+    print("    - example_function_with_dates")
+    print("    - example_discover_then_call")
+    print("    - kdb_date_format_guide")
+    print("    - dynamic_function_calling_guide")
+    print("\n✅ Server ready for connections!\n")
+    
+    mcp.run()
