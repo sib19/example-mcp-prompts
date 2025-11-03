@@ -1,0 +1,338 @@
+import paramiko
+from typing import Optional
+from mcp.server.fastmcp import FastMCP
+
+# Initialize FastMCP server
+
+mcp = FastMCP(“log-reader”)
+
+# Store SSH client globally
+
+ssh_client: Optional[paramiko.SSHClient] = None
+
+@mcp.tool()
+def connect_server(
+hostname: str,
+username: str,
+password: Optional[str] = None,
+key_path: Optional[str] = None,
+port: int = 22
+) -> str:
+“””
+Connect to a remote server via SSH.
+
+```
+Args:
+    hostname: Remote server hostname or IP address
+    username: SSH username
+    password: SSH password (optional if using key)
+    key_path: Path to SSH private key file (optional)
+    port: SSH port (default: 22)
+
+Returns:
+    Connection status message
+"""
+global ssh_client
+
+try:
+    ssh_client = paramiko.SSHClient()
+    ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    
+    if key_path:
+        ssh_client.connect(
+            hostname=hostname,
+            port=port,
+            username=username,
+            key_filename=key_path,
+            timeout=10
+        )
+    else:
+        ssh_client.connect(
+            hostname=hostname,
+            port=port,
+            username=username,
+            password=password,
+            timeout=10
+        )
+    
+    return f"✓ Successfully connected to {hostname} as {username}"
+except Exception as e:
+    return f"✗ Connection failed: {str(e)}"
+```
+
+@mcp.tool()
+def disconnect_server() -> str:
+“””
+Disconnect from the remote server.
+
+```
+Returns:
+    Disconnection status message
+"""
+global ssh_client
+
+if ssh_client:
+    ssh_client.close()
+    ssh_client = None
+    return "✓ Disconnected from server"
+return "ℹ No active connection"
+```
+
+@mcp.tool()
+def read_log_file(file_path: str, lines: int = 100) -> str:
+“””
+Read contents of a log file from the remote server.
+
+```
+Args:
+    file_path: Full path to the log file on remote server
+    lines: Number of lines to read from end of file (default: 100)
+
+Returns:
+    Log file contents
+"""
+global ssh_client
+
+if not ssh_client:
+    return "✗ Not connected to server. Use connect_server first."
+
+try:
+    stdin, stdout, stderr = ssh_client.exec_command(f"tail -n {lines} '{file_path}'")
+    output = stdout.read().decode('utf-8', errors='replace')
+    error = stderr.read().decode('utf-8', errors='replace')
+    
+    if error and "No such file" in error:
+        return f"✗ Error: {error.strip()}"
+    
+    if not output:
+        return f"ℹ File is empty or no output: {file_path}"
+    
+    return f"Last {lines} lines from {file_path}:\n{'='*60}\n{output}"
+except Exception as e:
+    return f"✗ Error reading file: {str(e)}"
+```
+
+@mcp.tool()
+def tail_log(file_path: str, lines: int = 50) -> str:
+“””
+Tail a log file (get last N lines) from the remote server.
+
+```
+Args:
+    file_path: Full path to the log file
+    lines: Number of lines to tail (default: 50)
+
+Returns:
+    Last N lines of the log file
+"""
+return read_log_file(file_path, lines)
+```
+
+@mcp.tool()
+def grep_logs(
+file_path: str,
+pattern: str,
+case_sensitive: bool = False,
+context_lines: int = 0,
+max_results: int = 100
+) -> str:
+“””
+Search for patterns in log files using grep.
+
+```
+Args:
+    file_path: Full path to the log file
+    pattern: Pattern to search for (supports regex)
+    case_sensitive: Whether search is case sensitive (default: False)
+    context_lines: Number of context lines to show around matches (default: 0)
+    max_results: Maximum number of results to return (default: 100)
+
+Returns:
+    Matching log lines
+"""
+global ssh_client
+
+if not ssh_client:
+    return "✗ Not connected to server. Use connect_server first."
+
+try:
+    grep_cmd = "grep"
+    if not case_sensitive:
+        grep_cmd += " -i"
+    if context_lines > 0:
+        grep_cmd += f" -C {context_lines}"
+    grep_cmd += f" -m {max_results}"
+    
+    # Escape single quotes in pattern
+    escaped_pattern = pattern.replace("'", "'\\''")
+    command = f"{grep_cmd} '{escaped_pattern}' '{file_path}'"
+    
+    stdin, stdout, stderr = ssh_client.exec_command(command)
+    output = stdout.read().decode('utf-8', errors='replace')
+    error = stderr.read().decode('utf-8', errors='replace')
+    
+    if not output:
+        if "No such file" in error:
+            return f"✗ Error: {error.strip()}"
+        return f"ℹ No matches found for pattern: {pattern}"
+    
+    return f"Grep results for '{pattern}' in {file_path}:\n{'='*60}\n{output}"
+except Exception as e:
+    return f"✗ Error: {str(e)}"
+```
+
+@mcp.tool()
+def list_log_files(directory: str = “/var/log”, pattern: str = “*.log”) -> str:
+“””
+List log files in a directory on the remote server.
+
+```
+Args:
+    directory: Directory path to list log files from (default: /var/log)
+    pattern: File pattern to match, e.g., '*.log', 'syslog*' (default: *.log)
+
+Returns:
+    List of log files with sizes and modification times
+"""
+global ssh_client
+
+if not ssh_client:
+    return "✗ Not connected to server. Use connect_server first."
+
+try:
+    # Use find with ls -lh for detailed info
+    command = f"find '{directory}' -name '{pattern}' -type f -exec ls -lh {{}} \\;"
+    stdin, stdout, stderr = ssh_client.exec_command(command)
+    output = stdout.read().decode('utf-8', errors='replace')
+    error = stderr.read().decode('utf-8', errors='replace')
+    
+    if error and "No such file" in error:
+        return f"✗ Error: Directory not found: {directory}"
+    
+    if not output:
+        return f"ℹ No log files matching '{pattern}' found in {directory}"
+    
+    return f"Log files in {directory} matching '{pattern}':\n{'='*60}\n{output}"
+except Exception as e:
+    return f"✗ Error: {str(e)}"
+```
+
+@mcp.tool()
+def search_logs_by_time(
+file_path: str,
+time_pattern: str,
+lines_after: int = 10
+) -> str:
+“””
+Search logs by timestamp pattern and get surrounding context.
+
+```
+Args:
+    file_path: Full path to the log file
+    time_pattern: Time pattern to search for (e.g., '2024-11-03', '14:30', 'Nov 3')
+    lines_after: Number of lines to show after match (default: 10)
+
+Returns:
+    Log entries matching the time pattern with context
+"""
+global ssh_client
+
+if not ssh_client:
+    return "✗ Not connected to server. Use connect_server first."
+
+try:
+    escaped_pattern = time_pattern.replace("'", "'\\''")
+    command = f"grep -i -A {lines_after} '{escaped_pattern}' '{file_path}'"
+    
+    stdin, stdout, stderr = ssh_client.exec_command(command)
+    output = stdout.read().decode('utf-8', errors='replace')
+    error = stderr.read().decode('utf-8', errors='replace')
+    
+    if not output:
+        return f"ℹ No log entries found for time pattern: {time_pattern}"
+    
+    return f"Log entries for '{time_pattern}' in {file_path}:\n{'='*60}\n{output}"
+except Exception as e:
+    return f"✗ Error: {str(e)}"
+```
+
+@mcp.tool()
+def get_log_stats(file_path: str) -> str:
+“””
+Get statistics about a log file (size, line count, date range).
+
+```
+Args:
+    file_path: Full path to the log file
+
+Returns:
+    Log file statistics
+"""
+global ssh_client
+
+if not ssh_client:
+    return "✗ Not connected to server. Use connect_server first."
+
+try:
+    # Get file size, line count, first and last lines
+    commands = f"""
+    echo "File: {file_path}"
+    echo "Size: $(du -h '{file_path}' | cut -f1)"
+    echo "Lines: $(wc -l < '{file_path}')"
+    echo "First line: $(head -n 1 '{file_path}')"
+    echo "Last line: $(tail -n 1 '{file_path}')"
+    """
+    
+    stdin, stdout, stderr = ssh_client.exec_command(commands)
+    output = stdout.read().decode('utf-8', errors='replace')
+    error = stderr.read().decode('utf-8', errors='replace')
+    
+    if error and "No such file" in error:
+        return f"✗ Error: File not found: {file_path}"
+    
+    return f"Log file statistics:\n{'='*60}\n{output}"
+except Exception as e:
+    return f"✗ Error: {str(e)}"
+```
+
+@mcp.tool()
+def run_custom_command(command: str) -> str:
+“””
+Run a custom shell command on the remote server.
+WARNING: Use with caution. Only for advanced log analysis.
+
+```
+Args:
+    command: Shell command to execute
+
+Returns:
+    Command output
+"""
+global ssh_client
+
+if not ssh_client:
+    return "✗ Not connected to server. Use connect_server first."
+
+# Basic safety check
+dangerous_commands = ['rm ', 'delete', 'drop', 'shutdown', 'reboot', 'mkfs']
+if any(dangerous in command.lower() for dangerous in dangerous_commands):
+    return "✗ Dangerous command detected. This tool is for log reading only."
+
+try:
+    stdin, stdout, stderr = ssh_client.exec_command(command, timeout=30)
+    output = stdout.read().decode('utf-8', errors='replace')
+    error = stderr.read().decode('utf-8', errors='replace')
+    
+    result = ""
+    if output:
+        result += f"Output:\n{output}\n"
+    if error:
+        result += f"Errors:\n{error}"
+    
+    return result if result else "ℹ Command executed with no output"
+except Exception as e:
+    return f"✗ Error executing command: {str(e)}"
+```
+
+if **name** == “**main**”:
+mcp.run()
