@@ -1,0 +1,428 @@
+“””
+Hybrid Log MCP Server with FastMCP
+Reads logs from multiple on-premise servers and optionally stores in vector DB
+“””
+
+import os
+import json
+from pathlib import Path
+from typing import List, Dict, Optional
+from datetime import datetime
+import paramiko
+from mcp.server.fastmcp import FastMCP
+import yaml
+
+# Optional vector DB imports (install as needed)
+
+try:
+from chromadb import Client as ChromaClient
+from chromadb.config import Settings
+VECTOR_DB_AVAILABLE = True
+except ImportError:
+VECTOR_DB_AVAILABLE = False
+
+# Initialize FastMCP server
+
+mcp = FastMCP(“log-reader-server”)
+
+# Configuration file path
+
+CONFIG_FILE = os.getenv(“LOG_SERVER_CONFIG”, “log_servers.yaml”)
+
+class LogServerConfig:
+“”“Configuration for on-premise log servers”””
+
+```
+def __init__(self, config_path: str):
+    self.config_path = config_path
+    self.servers = []
+    self.vector_db_config = {}
+    self.load_config()
+
+def load_config(self):
+    """Load server configurations from YAML file"""
+    if not os.path.exists(self.config_path):
+        self._create_default_config()
+    
+    with open(self.config_path, 'r') as f:
+        config = yaml.safe_load(f)
+        self.servers = config.get('servers', [])
+        self.vector_db_config = config.get('vector_db', {})
+
+def _create_default_config(self):
+    """Create a default configuration file"""
+    default_config = {
+        'servers': [
+            {
+                'name': 'app-server-1',
+                'host': '192.168.1.10',
+                'port': 22,
+                'username': 'loguser',
+                'auth_type': 'key',  # 'key' or 'password'
+                'key_path': '~/.ssh/id_rsa',
+                'password': None,
+                'log_paths': [
+                    '/var/log/app/*.log',
+                    '/var/log/nginx/access.log'
+                ],
+                'enabled': True
+            },
+            {
+                'name': 'db-server-1',
+                'host': '192.168.1.11',
+                'port': 22,
+                'username': 'loguser',
+                'auth_type': 'password',
+                'key_path': None,
+                'password': 'changeme',
+                'log_paths': [
+                    '/var/log/postgresql/*.log'
+                ],
+                'enabled': True
+            }
+        ],
+        'vector_db': {
+            'enabled': False,
+            'type': 'chroma',  # 'chroma', 'pinecone', etc.
+            'persist_directory': './chroma_db',
+            'collection_name': 'server_logs',
+            'auto_index': True,
+            'batch_size': 100
+        }
+    }
+    
+    with open(self.config_path, 'w') as f:
+        yaml.dump(default_config, f, default_flow_style=False)
+    
+    print(f"Created default config at {self.config_path}")
+```
+
+class VectorDBManager:
+“”“Manages vector database operations for log storage”””
+
+```
+def __init__(self, config: Dict):
+    self.enabled = config.get('enabled', False) and VECTOR_DB_AVAILABLE
+    self.config = config
+    self.client = None
+    self.collection = None
+    
+    if self.enabled:
+        self._initialize_db()
+
+def _initialize_db(self):
+    """Initialize vector database connection"""
+    if self.config.get('type') == 'chroma':
+        persist_dir = self.config.get('persist_directory', './chroma_db')
+        self.client = ChromaClient(Settings(
+            persist_directory=persist_dir,
+            anonymized_telemetry=False
+        ))
+        
+        collection_name = self.config.get('collection_name', 'server_logs')
+        self.collection = self.client.get_or_create_collection(
+            name=collection_name,
+            metadata={"description": "Server log entries"}
+        )
+
+def index_logs(self, logs: List[Dict]) -> int:
+    """Index logs into vector database"""
+    if not self.enabled or not logs:
+        return 0
+    
+    documents = []
+    metadatas = []
+    ids = []
+    
+    for idx, log in enumerate(logs):
+        doc_id = f"{log.get('server')}_{log.get('timestamp', datetime.now().isoformat())}_{idx}"
+        
+        documents.append(log.get('content', ''))
+        metadatas.append({
+            'server': log.get('server', 'unknown'),
+            'file': log.get('file', 'unknown'),
+            'timestamp': log.get('timestamp', ''),
+            'level': log.get('level', 'INFO')
+        })
+        ids.append(doc_id)
+    
+    self.collection.add(
+        documents=documents,
+        metadatas=metadatas,
+        ids=ids
+    )
+    
+    return len(documents)
+
+def search_logs(self, query: str, n_results: int = 10, filter_dict: Optional[Dict] = None) -> List[Dict]:
+    """Search logs using semantic similarity"""
+    if not self.enabled:
+        return []
+    
+    results = self.collection.query(
+        query_texts=[query],
+        n_results=n_results,
+        where=filter_dict
+    )
+    
+    return [{
+        'content': doc,
+        'metadata': meta,
+        'distance': dist
+    } for doc, meta, dist in zip(
+        results['documents'][0],
+        results['metadatas'][0],
+        results['distances'][0]
+    )]
+```
+
+class LogReader:
+“”“Reads logs from remote servers via SSH”””
+
+```
+def __init__(self, server_config: Dict):
+    self.config = server_config
+    self.ssh_client = None
+
+def connect(self):
+    """Establish SSH connection"""
+    self.ssh_client = paramiko.SSHClient()
+    self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    
+    try:
+        if self.config['auth_type'] == 'key':
+            key_path = os.path.expanduser(self.config['key_path'])
+            self.ssh_client.connect(
+                hostname=self.config['host'],
+                port=self.config['port'],
+                username=self.config['username'],
+                key_filename=key_path,
+                timeout=10
+            )
+        else:
+            self.ssh_client.connect(
+                hostname=self.config['host'],
+                port=self.config['port'],
+                username=self.config['username'],
+                password=self.config['password'],
+                timeout=10
+            )
+        return True
+    except Exception as e:
+        print(f"Connection failed to {self.config['name']}: {str(e)}")
+        return False
+
+def read_logs(self, file_pattern: str, lines: int = 100) -> List[str]:
+    """Read log files matching pattern"""
+    if not self.ssh_client:
+        if not self.connect():
+            return []
+    
+    try:
+        # Use tail to get last N lines
+        command = f"tail -n {lines} {file_pattern}"
+        stdin, stdout, stderr = self.ssh_client.exec_command(command)
+        
+        output = stdout.read().decode('utf-8')
+        errors = stderr.read().decode('utf-8')
+        
+        if errors and 'No such file' not in errors:
+            print(f"Error reading logs: {errors}")
+        
+        return output.strip().split('\n') if output else []
+    except Exception as e:
+        print(f"Error executing command: {str(e)}")
+        return []
+
+def close(self):
+    """Close SSH connection"""
+    if self.ssh_client:
+        self.ssh_client.close()
+```
+
+# Initialize configuration and vector DB
+
+config = LogServerConfig(CONFIG_FILE)
+vector_db = VectorDBManager(config.vector_db_config)
+
+@mcp.tool()
+def list_servers() -> Dict:
+“”“List all configured log servers”””
+servers_info = []
+for server in config.servers:
+servers_info.append({
+‘name’: server[‘name’],
+‘host’: server[‘host’],
+‘enabled’: server.get(‘enabled’, True),
+‘log_paths’: server[‘log_paths’]
+})
+
+```
+return {
+    'servers': servers_info,
+    'total': len(servers_info),
+    'vector_db_enabled': vector_db.enabled
+}
+```
+
+@mcp.tool()
+def read_server_logs(
+server_name: str,
+log_path: Optional[str] = None,
+lines: int = 100,
+index_to_vector_db: bool = False
+) -> Dict:
+“””
+Read logs from a specific server
+
+```
+Args:
+    server_name: Name of the server to read from
+    log_path: Specific log file path (optional, uses configured paths if not provided)
+    lines: Number of lines to retrieve (default: 100)
+    index_to_vector_db: Whether to index logs into vector DB (default: False)
+"""
+# Find server config
+server_config = next((s for s in config.servers if s['name'] == server_name), None)
+
+if not server_config:
+    return {'error': f"Server '{server_name}' not found in configuration"}
+
+if not server_config.get('enabled', True):
+    return {'error': f"Server '{server_name}' is disabled"}
+
+# Determine which log paths to read
+paths_to_read = [log_path] if log_path else server_config['log_paths']
+
+reader = LogReader(server_config)
+all_logs = []
+
+for path in paths_to_read:
+    log_lines = reader.read_logs(path, lines)
+    
+    for line in log_lines:
+        if line.strip():
+            all_logs.append({
+                'server': server_name,
+                'file': path,
+                'content': line,
+                'timestamp': datetime.now().isoformat()
+            })
+
+reader.close()
+
+# Optionally index to vector DB
+indexed_count = 0
+if index_to_vector_db and all_logs:
+    indexed_count = vector_db.index_logs(all_logs)
+
+return {
+    'server': server_name,
+    'logs_retrieved': len(all_logs),
+    'logs': all_logs,
+    'indexed_to_vector_db': indexed_count
+}
+```
+
+@mcp.tool()
+def read_all_servers_logs(
+lines: int = 50,
+index_to_vector_db: bool = False
+) -> Dict:
+“””
+Read logs from all enabled servers
+
+```
+Args:
+    lines: Number of lines to retrieve per log file (default: 50)
+    index_to_vector_db: Whether to index logs into vector DB (default: False)
+"""
+results = {}
+total_logs = 0
+total_indexed = 0
+
+for server_config in config.servers:
+    if not server_config.get('enabled', True):
+        continue
+    
+    server_name = server_config['name']
+    result = read_server_logs(server_name, lines=lines, index_to_vector_db=False)
+    
+    if 'error' not in result:
+        results[server_name] = result
+        total_logs += result['logs_retrieved']
+        
+        # Batch index after collecting from all servers
+        if index_to_vector_db and result.get('logs'):
+            total_indexed += vector_db.index_logs(result['logs'])
+
+return {
+    'servers_queried': len(results),
+    'total_logs': total_logs,
+    'results': results,
+    'indexed_to_vector_db': total_indexed
+}
+```
+
+@mcp.tool()
+def search_logs_semantic(
+query: str,
+n_results: int = 10,
+server_filter: Optional[str] = None
+) -> Dict:
+“””
+Search logs using semantic similarity (requires vector DB)
+
+```
+Args:
+    query: Natural language search query
+    n_results: Number of results to return (default: 10)
+    server_filter: Filter by specific server name (optional)
+"""
+if not vector_db.enabled:
+    return {'error': 'Vector DB is not enabled. Set vector_db.enabled=true in config.'}
+
+filter_dict = {'server': server_filter} if server_filter else None
+results = vector_db.search_logs(query, n_results, filter_dict)
+
+return {
+    'query': query,
+    'results_count': len(results),
+    'results': results
+}
+```
+
+@mcp.tool()
+def tail_server_logs(
+server_name: str,
+log_path: str,
+lines: int = 20
+) -> Dict:
+“””
+Tail (follow) the last N lines of a log file in real-time
+
+```
+Args:
+    server_name: Name of the server
+    log_path: Path to the log file
+    lines: Number of recent lines to show (default: 20)
+"""
+return read_server_logs(server_name, log_path, lines, index_to_vector_db=False)
+```
+
+@mcp.tool()
+def reload_config() -> Dict:
+“”“Reload server configuration from YAML file”””
+try:
+config.load_config()
+return {
+‘status’: ‘success’,
+‘servers_loaded’: len(config.servers),
+‘vector_db_enabled’: vector_db.enabled
+}
+except Exception as e:
+return {‘error’: f’Failed to reload config: {str(e)}’}
+
+if **name** == “**main**”:
+# Run the MCP server
+mcp.run(transport=‘stdio’)
