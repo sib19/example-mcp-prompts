@@ -1,0 +1,172 @@
+# log_servers.yaml - Configuration for on-premise log servers
+
+servers:
+
+# Application Server
+
+- name: app-server-1
+  host: 192.168.1.10
+  port: 22
+  username: loguser
+  auth_type: key  # ‘key’ or ‘password’
+  key_path: ~/.ssh/id_rsa
+  password: null
+  log_paths:
+  - /var/log/app/application.log
+  - /var/log/app/error.log
+  - /var/log/nginx/access.log
+  - /var/log/nginx/error.log
+    enabled: true
+
+# Database Server
+
+- name: db-server-1
+  host: 192.168.1.11
+  port: 22
+  username: loguser
+  auth_type: password
+  key_path: null
+  password: your_secure_password_here
+  log_paths:
+  - /var/log/postgresql/postgresql-*.log
+  - /var/log/mysql/error.log
+    enabled: true
+
+# API Server
+
+- name: api-server-1
+  host: 192.168.1.12
+  port: 22
+  username: loguser
+  auth_type: key
+  key_path: ~/.ssh/api_server_key
+  password: null
+  log_paths:
+  - /var/log/api/*.log
+  - /var/log/redis/redis-server.log
+    enabled: true
+
+# Web Server
+
+- name: web-server-1
+  host: 192.168.1.13
+  port: 22
+  username: loguser
+  auth_type: key
+  key_path: ~/.ssh/id_rsa
+  password: null
+  log_paths:
+  - /var/log/apache2/access.log
+  - /var/log/apache2/error.log
+    enabled: true
+
+# Vector Database Configuration (for semantic search)
+
+vector_db:
+enabled: false  # Set to true to enable vector DB storage
+type: chroma  # Options: ‘chroma’, ‘pinecone’, ‘weaviate’
+persist_directory: ./chroma_db
+collection_name: server_logs
+auto_index: true  # Automatically index new logs
+batch_size: 100  # Number of logs to batch for indexing
+
+# —
+
+# requirements.txt
+
+# fastmcp
+
+# paramiko>=3.0.0
+
+# pyyaml>=6.0
+
+# chromadb>=0.4.0  # Optional: for vector DB support
+
+# sentence-transformers>=2.2.0  # Optional: for embeddings
+
+# —
+
+# .env.example
+
+# LOG_SERVER_CONFIG=./log_servers.yaml
+
+# MCP_SERVER_PORT=8080
+
+# —
+
+# README.md Setup Instructions
+
+## Installation
+
+1. Install dependencies:
+
+```bash
+pip install fastmcp paramiko pyyaml chromadb sentence-transformers
+```
+
+1. Configure your servers:
+- Copy `log_servers.yaml.example` to `log_servers.yaml`
+- Update with your server details
+- Set up SSH keys or passwords for authentication
+1. Set up SSH access:
+
+```bash
+# Generate SSH key if needed
+ssh-keygen -t rsa -b 4096 -f ~/.ssh/log_reader_key
+
+# Copy to servers
+ssh-copy-id -i ~/.ssh/log_reader_key.pub user@server-ip
+```
+
+1. Run the MCP server:
+
+```bash
+python log_mcp_server.py
+```
+
+## Usage with Claude Desktop
+
+Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on Mac):
+
+```json
+{
+  "mcpServers": {
+    "log-reader": {
+      "command": "python",
+      "args": ["/path/to/log_mcp_server.py"],
+      "env": {
+        "LOG_SERVER_CONFIG": "/path/to/log_servers.yaml"
+      }
+    }
+  }
+}
+```
+
+## Available Tools
+
+1. **list_servers()** - List all configured servers
+1. **read_server_logs(server_name, log_path, lines, index_to_vector_db)** - Read logs from specific server
+1. **read_all_servers_logs(lines, index_to_vector_db)** - Read logs from all servers
+1. **search_logs_semantic(query, n_results, server_filter)** - Semantic search (requires vector DB)
+1. **tail_server_logs(server_name, log_path, lines)** - Tail recent log entries
+1. **reload_config()** - Reload configuration without restart
+
+## Security Best Practices
+
+1. Use SSH keys instead of passwords
+1. Create dedicated log reading users with read-only permissions
+1. Store sensitive credentials in environment variables
+1. Restrict log file permissions on servers
+1. Use VPN or secure network for server access
+1. Regularly rotate SSH keys
+
+## Vector DB Features
+
+Enable vector DB in config to get:
+
+- Semantic search across logs
+- Find similar error patterns
+- AI-powered log analysis
+- Historical pattern recognition
+
+Set `vector_db.enabled: true` and Claude can search logs with natural language!
