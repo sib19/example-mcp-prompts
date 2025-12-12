@@ -1,0 +1,253 @@
+import functools
+import time
+from typing import Optional, Callable, Any
+
+# Global token storage
+
+_auth_token: Optional[str] = None
+_token_expiry: float = 0
+
+# ============================================================================
+
+# CORE TOKEN MANAGEMENT
+
+# ============================================================================
+
+def get_login_token() -> str:
+“”“Simulates getting a login token from authentication service.”””
+print(“🔐 Fetching new login token…”)
+time.sleep(0.5)  # Simulate API call
+token = f”token_{int(time.time())}”
+print(f”✓ Token obtained: {token}”)
+return token
+
+def refresh_token_if_needed() -> str:
+“”“Checks if token exists and is valid, refreshes if needed.”””
+global _auth_token, _token_expiry
+current_time = time.time()
+
+```
+if _auth_token is None or current_time >= _token_expiry:
+    _auth_token = get_login_token()
+    _token_expiry = current_time + 3600
+else:
+    print(f"✓ Using cached token: {_auth_token}")
+
+return _auth_token
+```
+
+# ============================================================================
+
+# DECORATOR PATTERN EXAMPLES
+
+# ============================================================================
+
+# Example 1: Basic Decorator - Token as First Argument
+
+def requires_auth(func: Callable) -> Callable:
+“”“Basic decorator that passes token as first argument.”””
+@functools.wraps(func)
+def wrapper(*args, **kwargs):
+token = refresh_token_if_needed()
+return func(token, *args, **kwargs)
+return wrapper
+
+# Example 2: Decorator with Token as Keyword Argument
+
+def requires_auth_kwarg(func: Callable) -> Callable:
+“”“Decorator that passes token as ‘token’ keyword argument.”””
+@functools.wraps(func)
+def wrapper(*args, **kwargs):
+token = refresh_token_if_needed()
+kwargs[‘token’] = token
+return func(*args, **kwargs)
+return wrapper
+
+# Example 3: Decorator with Headers Dictionary
+
+def requires_auth_headers(func: Callable) -> Callable:
+“”“Decorator that creates headers dict with Authorization.”””
+@functools.wraps(func)
+def wrapper(*args, **kwargs):
+token = refresh_token_if_needed()
+headers = {“Authorization”: f”Bearer {token}”}
+return func(headers, *args, **kwargs)
+return wrapper
+
+# Example 4: Decorator with Retry Logic
+
+def requires_auth_with_retry(max_retries: int = 3):
+“”“Decorator that retries on authentication failure.”””
+def decorator(func: Callable) -> Callable:
+@functools.wraps(func)
+def wrapper(*args, **kwargs):
+for attempt in range(max_retries):
+try:
+token = refresh_token_if_needed()
+return func(token, *args, **kwargs)
+except AuthenticationError as e:
+print(f”⚠️  Auth failed (attempt {attempt + 1}/{max_retries}): {e}”)
+global _auth_token, _token_expiry
+_auth_token = None  # Force token refresh
+if attempt == max_retries - 1:
+raise
+return None
+return wrapper
+return decorator
+
+# Example 5: Class-based Decorator
+
+class RequiresAuth:
+“”“Class-based decorator for authentication.”””
+def **init**(self, func: Callable):
+self.func = func
+functools.update_wrapper(self, func)
+
+```
+def __call__(self, *args, **kwargs):
+    token = refresh_token_if_needed()
+    return self.func(token, *args, **kwargs)
+```
+
+# Example 6: Decorator with Custom Token Parameter Name
+
+def requires_auth_custom_param(param_name: str = “auth_token”):
+“”“Decorator that allows custom parameter name for token.”””
+def decorator(func: Callable) -> Callable:
+@functools.wraps(func)
+def wrapper(*args, **kwargs):
+token = refresh_token_if_needed()
+kwargs[param_name] = token
+return func(*args, **kwargs)
+return wrapper
+return decorator
+
+# Custom exception for example 4
+
+class AuthenticationError(Exception):
+pass
+
+# ============================================================================
+
+# USAGE EXAMPLES
+
+# ============================================================================
+
+# Using Example 1: Token as first argument
+
+@requires_auth
+def get_user_profile(token: str, user_id: int) -> dict:
+print(f”\n📊 [Ex1] Getting profile for user {user_id}”)
+print(f”   Token: {token}”)
+return {“user_id”: user_id, “name”: “Alice”}
+
+# Using Example 2: Token as keyword argument
+
+@requires_auth_kwarg
+def update_settings(user_id: int, settings: dict, token: str = None) -> dict:
+print(f”\n⚙️  [Ex2] Updating settings for user {user_id}”)
+print(f”   Token: {token}”)
+print(f”   Settings: {settings}”)
+return {“success”: True}
+
+# Using Example 3: Headers dictionary
+
+@requires_auth_headers
+def make_api_request(headers: dict, endpoint: str, data: dict) -> dict:
+print(f”\n🌐 [Ex3] Making API request to {endpoint}”)
+print(f”   Headers: {headers}”)
+print(f”   Data: {data}”)
+return {“status”: “ok”}
+
+# Using Example 4: With retry logic
+
+@requires_auth_with_retry(max_retries=2)
+def delete_resource(token: str, resource_id: int) -> dict:
+print(f”\n🗑️  [Ex4] Deleting resource {resource_id}”)
+print(f”   Token: {token}”)
+# Simulate occasional auth failures
+# if resource_id == 999:
+#     raise AuthenticationError(“Invalid token”)
+return {“deleted”: True}
+
+# Using Example 5: Class-based decorator
+
+@RequiresAuth
+def fetch_data(token: str, query: str) -> list:
+print(f”\n🔍 [Ex5] Fetching data with query: {query}”)
+print(f”   Token: {token}”)
+return [{“id”: 1, “data”: “sample”}]
+
+# Using Example 6: Custom parameter name
+
+@requires_auth_custom_param(param_name=“api_key”)
+def send_notification(user_id: int, message: str, api_key: str = None) -> dict:
+print(f”\n📧 [Ex6] Sending notification to user {user_id}”)
+print(f”   API Key: {api_key}”)
+print(f”   Message: {message}”)
+return {“sent”: True}
+
+# Combining multiple decorators
+
+def log_execution(func: Callable) -> Callable:
+“”“Additional decorator for logging.”””
+@functools.wraps(func)
+def wrapper(*args, **kwargs):
+print(f”\n▶️  Starting {func.**name**}…”)
+result = func(*args, **kwargs)
+print(f”✅ Finished {func.**name**}”)
+return result
+return wrapper
+
+@log_execution
+@requires_auth
+def complex_operation(token: str, operation: str) -> dict:
+print(f”\n🔧 [Ex7] Performing {operation}”)
+print(f”   Token: {token}”)
+return {“operation”: operation, “status”: “completed”}
+
+# ============================================================================
+
+# DEMO
+
+# ============================================================================
+
+if **name** == “**main**”:
+print(”=” * 60)
+print(“DECORATOR PATTERN EXAMPLES”)
+print(”=” * 60)
+
+```
+# Example 1
+get_user_profile(user_id=123)
+
+# Example 2
+update_settings(user_id=123, settings={"theme": "dark"})
+
+# Example 3
+make_api_request(endpoint="/api/v1/data", data={"key": "value"})
+
+# Example 4
+delete_resource(resource_id=456)
+
+# Example 5
+fetch_data(query="SELECT * FROM users")
+
+# Example 6
+send_notification(user_id=789, message="Hello!")
+
+# Example 7 - Multiple decorators
+complex_operation(operation="data_migration")
+
+print("\n" + "=" * 60)
+print("TOKEN CACHING DEMONSTRATION")
+print("=" * 60)
+
+# These will reuse the cached token
+get_user_profile(user_id=111)
+update_settings(user_id=222, settings={"language": "en"})
+
+print("\n" + "=" * 60)
+print("All examples completed!")
+print("=" * 60)
+```
