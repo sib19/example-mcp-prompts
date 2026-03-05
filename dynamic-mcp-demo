@@ -1,0 +1,172 @@
+# “””
+kdb_mcp_demo.py
+
+Runs the dynamic KDB MCP server using a **mock KDB connection** so you can
+test and explore the tool generation without a live KDB+/Q process.
+
+Usage:
+python kdb_mcp_demo.py          # stdio transport (Claude Desktop)
+python kdb_mcp_demo.py –sse    # SSE transport  (HTTP / inspect)
+
+The mock exposes these sample KDB functions:
+getTrades(sym, n)   – last N trades for a symbol
+getVWAP(sym, date)  – volume-weighted average price
+getOHLCV(sym, date) – OHLCV bar for a symbol/date
+listSymbols()       – all available symbols
+getPortfolio()      – current portfolio positions
+“””
+
+import sys
+import json
+import argparse
+import textwrap
+import logging
+from typing import Any
+
+log = logging.getLogger(“kdb_mcp_demo”)
+logging.basicConfig(level=logging.INFO, format=”%(asctime)s [%(levelname)s] %(message)s”)
+
+# ── Inline mock; no qpython needed ───────────────────────────────────────────
+
+import types, importlib, unittest.mock as mock
+
+# Stub qpython so kdb_mcp_server can be imported without the real library
+
+for mod_name in [“qpython”, “qpython.qconnection”, “qpython.qtype”,
+“qpython.qcollection”]:
+sys.modules.setdefault(mod_name, types.ModuleType(mod_name))
+
+# Provide the symbols the main module references
+
+qcoll = sys.modules[“qpython.qcollection”]
+qcoll.QDictionary = dict  # type: ignore
+qcoll.QTable      = list  # type: ignore
+
+import numpy as np  # noqa: E402  (after stubs)
+
+# ── Mock KDB data ─────────────────────────────────────────────────────────────
+
+_MOCK_FUNCTIONS = [
+{
+“name”:   “getTrades”,
+“params”: [“sym”, “n”],
+“body”:   “select last n from trade where sym=`$sym", "doc":    "Return the last N trades for the given symbol.", }, { "name":   "getVWAP", "params": ["sym", "date"], "body":   "select vwap:size wavg price from trade where sym=`$sym, date=`date$date", "doc":    "Compute VWAP for a symbol on a given date.", }, { "name":   "getOHLCV", "params": ["sym", "date"], "body":   "select o:first price, h:max price, l:min price, c:last price, v:sum size from trade where sym=`$sym, date=`date$date”,
+“doc”:    “Return OHLCV bar for symbol/date.”,
+},
+{
+“name”:   “listSymbols”,
+“params”: [],
+“body”:   “exec distinct sym from trade”,
+“doc”:    “List all symbols available in the trade table.”,
+},
+{
+“name”:   “getPortfolio”,
+“params”: [],
+“body”:   “portfolio”,
+“doc”:    “Return current portfolio positions.”,
+},
+]
+
+_MOCK_RESULTS = {
+“getTrades”: lambda sym, n: [
+{“time”: “09:30:01”, “sym”: sym, “price”: 150.25, “size”: 100},
+{“time”: “09:30:05”, “sym”: sym, “price”: 150.30, “size”: 200},
+{“time”: “09:30:10”, “sym”: sym, “price”: 150.28, “size”: 150},
+],
+“getVWAP”: lambda sym, date: {“sym”: sym, “date”: date, “vwap”: 150.27},
+“getOHLCV”: lambda sym, date: {
+“sym”: sym, “date”: date,
+“o”: 149.50, “h”: 151.00, “l”: 149.00, “c”: 150.80, “v”: 1_200_000,
+},
+“listSymbols”: lambda: [“AAPL”, “GOOG”, “MSFT”, “AMZN”, “TSLA”],
+“getPortfolio”: lambda: [
+{“sym”: “AAPL”, “qty”: 500, “avgCost”: 148.10},
+{“sym”: “MSFT”, “qty”: 200, “avgCost”: 310.00},
+],
+}
+
+class MockKDBConnection:
+“”“Mimics KDBConnection without needing a real KDB+ process.”””
+
+```
+def __init__(self):
+    self.host = "mock-host"
+    self.port = 9999
+
+def connect(self):
+    log.info("MockKDBConnection: connected (no real KDB+ process).")
+
+def close(self):
+    pass
+
+def query(self, expr: str) -> Any:
+    log.info("MockKDB query: %s", expr)
+    for fn_name, mock_fn in _MOCK_RESULTS.items():
+        if expr.startswith(fn_name):
+            # Extract bracket args  fn[arg1; arg2]
+            inner = expr[len(fn_name):]
+            if inner.startswith("[") and inner.endswith("]"):
+                raw_args = [a.strip().strip('"').strip("'")
+                            for a in inner[1:-1].split(";")]
+                # strip Q type coercions like `$string "AAPL" → AAPL
+                args = [a.split('"')[-2] if '"' in a else a for a in raw_args]
+                try:
+                    return mock_fn(*args)
+                except TypeError:
+                    return mock_fn()
+            else:
+                return mock_fn()
+    # fallback: count trade etc.
+    return {"expr": expr, "result": "mock_result"}
+
+def safe_query(self, expr: str, default: Any = None) -> Any:
+    try:
+        return self.query(expr)
+    except Exception:
+        return default
+```
+
+# ── Patch kdb_mcp_server to use mock objects ──────────────────────────────────
+
+import importlib.util, pathlib, types as _types  # noqa: E402
+
+_server_path = pathlib.Path(**file**).parent / “kdb_mcp_server.py”
+
+# Dynamically load the server module
+
+spec = importlib.util.spec_from_file_location(“kdb_mcp_server”, _server_path)
+server_mod = importlib.util.module_from_spec(spec)
+
+# Inject stubs before executing module body
+
+server_mod.KDBConnection   = MockKDBConnection  # type: ignore
+server_mod.introspect_functions = lambda kdb: _MOCK_FUNCTIONS  # type: ignore
+
+spec.loader.exec_module(server_mod)
+
+def main():
+ap = argparse.ArgumentParser(description=“KDB MCP Demo (mock KDB)”)
+ap.add_argument(”–sse”, action=“store_true”, help=“Use SSE transport”)
+args = ap.parse_args()
+
+```
+mcp = server_mod.build_server("mock-host", 9999, "", "")
+
+print("\n" + "=" * 60)
+print("  KDB MCP Demo Server – Mock Mode")
+print("=" * 60)
+print(f"  Transport : {'SSE (HTTP)' if args.sse else 'stdio'}")
+print(f"  Tools     : {len(mcp._tools)} registered")
+print()
+for name in sorted(mcp._tools):
+    print(f"    • {name}")
+print("=" * 60 + "\n")
+
+if args.sse:
+    mcp.run(transport="sse")
+else:
+    mcp.run(transport="stdio")
+```
+
+if **name** == “**main**”:
+main()
