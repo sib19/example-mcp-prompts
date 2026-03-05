@@ -1,0 +1,528 @@
+# “””
+Dynamic KDB+ FastMCP Server
+
+Connects to a KDB+/Q instance, introspects available functions,
+and dynamically registers each as a FastMCP tool with rich docstrings,
+parameter schemas, and a server-level prompt describing purpose and usage.
+
+Usage:
+python kdb_mcp_server.py –host localhost –port 5000 [–user kdb] [–password secret]
+
+Environment variables (override CLI args):
+KDB_HOST, KDB_PORT, KDB_USER, KDB_PASSWORD
+“””
+
+import os
+import sys
+import json
+import inspect
+import logging
+import argparse
+import textwrap
+from typing import Any, Dict, List, Optional, Tuple
+
+# ── third-party ──────────────────────────────────────────────────────────────
+
+try:
+import qpython.qconnection as qconn
+from qpython import qtype
+from qpython.qcollection import QDictionary, QTable
+import numpy as np
+except ImportError:
+sys.exit(
+“Missing dependency: pip install qpython fastmcp\n”
+“  qpython  – KDB+/Q wire protocol\n”
+“  fastmcp  – MCP server framework”
+)
+
+try:
+from fastmcp import FastMCP
+except ImportError:
+sys.exit(“Missing dependency: pip install fastmcp”)
+
+# ── logging ───────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+level=logging.INFO,
+format=”%(asctime)s [%(levelname)s] %(name)s – %(message)s”,
+)
+log = logging.getLogger(“kdb_mcp”)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# KDB Connection helper
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+class KDBConnection:
+“”“Thin wrapper around qpython that keeps a persistent connection.”””
+
+```
+def __init__(self, host: str, port: int, user: str = "", password: str = ""):
+    self.host = host
+    self.port = port
+    self.user = user
+    self.password = password
+    self._conn: Optional[qconn.QConnection] = None
+
+# ------------------------------------------------------------------
+def connect(self) -> None:
+    log.info("Connecting to KDB+ %s:%s …", self.host, self.port)
+    self._conn = qconn.QConnection(
+        host=self.host,
+        port=self.port,
+        username=self.user,
+        password=self.password,
+        pandas=False,        # raw qpython types – we convert ourselves
+    )
+    self._conn.open()
+    log.info("KDB+ connection established.")
+
+# ------------------------------------------------------------------
+def close(self) -> None:
+    if self._conn:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+        self._conn = None
+
+# ------------------------------------------------------------------
+def query(self, expr: str) -> Any:
+    """Execute a Q expression and return the raw result."""
+    if self._conn is None:
+        raise RuntimeError("Not connected to KDB+.")
+    return self._conn(expr)
+
+# ------------------------------------------------------------------
+def safe_query(self, expr: str, default: Any = None) -> Any:
+    try:
+        return self.query(expr)
+    except Exception as exc:
+        log.warning("KDB query failed [%s]: %s", expr, exc)
+        return default
+```
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# KDB Introspection helpers
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Q snippet that returns a keyed-table of user-defined functions:
+
+# name | params | body | doc
+
+_INTROSPECT_Q = r”””
+{[]
+fns: {x where {.q[x]~`function} each {type value x} each x} key `.;
+t: {[f]
+v:  value f;
+ps: $[4h=type v 1; string v 1; enlist “args”];
+bd: $[4<=count v; -3!v 4; “”];
+dc: $[0h=type v 0; (v 0); “”];
+(f; ps; bd; dc)
+} each fns;
+flip `name`params`body`doc!(fns; {x[1]} each t; {x[2]} each t; {x[3]} each t)
+}[]
+“””
+
+# Simpler fallback – just list public lambda names
+
+_LIST_LAMBDAS_Q = r”string each {x where {100h=type value x} each x} key `.”
+
+def _qval_to_python(val: Any) -> Any:
+“”“Recursively convert qpython native types to plain Python objects.”””
+if isinstance(val, (np.ndarray,)):
+return [_qval_to_python(v) for v in val.tolist()]
+if isinstance(val, QDictionary):
+return {_qval_to_python(k): _qval_to_python(v)
+for k, v in zip(val.keys(), val.values())}
+if isinstance(val, QTable):
+cols = [c.decode() if isinstance(c, bytes) else str(c) for c in val.dtype.names]
+rows = []
+for row in val:
+rows.append({c: *qval_to_python(row[c]) for c in cols})
+return rows
+if isinstance(val, bytes):
+return val.decode(errors=“replace”)
+if isinstance(val, (np.integer,)):
+return int(val)
+if isinstance(val, (np.floating,)):
+return float(val)
+if isinstance(val, (np.bool*,)):
+return bool(val)
+return val
+
+def introspect_functions(kdb: KDBConnection) -> List[Dict[str, str]]:
+“””
+Return a list of dicts with keys: name, params (list[str]), body, doc.
+Falls back to a simpler listing if the full introspection query fails.
+“””
+result = kdb.safe_query(_INTROSPECT_Q)
+functions: List[Dict[str, str]] = []
+
+```
+if result is not None:
+    rows = _qval_to_python(result)
+    if isinstance(rows, list):
+        for row in rows:
+            functions.append({
+                "name":   str(row.get("name", "unknown")),
+                "params": _normalise_params(row.get("params", [])),
+                "body":   str(row.get("body", "")),
+                "doc":    str(row.get("doc", "")),
+            })
+        log.info("Introspected %d KDB functions (full mode).", len(functions))
+        return functions
+
+# ── fallback ─────────────────────────────────────────────────────────────
+log.warning("Full introspection failed – using lightweight fallback.")
+names_raw = kdb.safe_query(_LIST_LAMBDAS_Q, default=[])
+names = _qval_to_python(names_raw) if names_raw is not None else []
+for name in names:
+    if isinstance(name, str) and name:
+        params_raw = kdb.safe_query(
+            f"string (value {name}) 1", default=[]
+        )
+        functions.append({
+            "name":   name,
+            "params": _normalise_params(_qval_to_python(params_raw)),
+            "body":   "",
+            "doc":    "",
+        })
+log.info("Introspected %d KDB functions (fallback mode).", len(functions))
+return functions
+```
+
+def _normalise_params(raw: Any) -> List[str]:
+if isinstance(raw, list):
+return [str(p) for p in raw if p]
+if isinstance(raw, str) and raw:
+return [raw]
+return []
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Result serialisation
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _serialise_result(val: Any) -> str:
+“”“Convert any KDB result to a JSON-safe string for MCP tool return.”””
+py = _qval_to_python(val)
+try:
+return json.dumps(py, default=str, indent=2)
+except Exception:
+return str(py)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Docstring builder
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_docstring(fn_meta: Dict[str, str]) -> str:
+“””
+Construct a rich docstring from KDB function metadata.
+Includes: purpose, parameters, return note, sample call, Q body snippet.
+“””
+name   = fn_meta[“name”]
+params = fn_meta[“params”]
+body   = fn_meta[“body”]
+doc    = fn_meta[“doc”]
+
+```
+param_block = "\n".join(
+    f"    {p} (str | int | float): Value passed as the '{p}' argument to the Q function."
+    for p in params
+) or "    (no parameters)"
+
+sample_args = ", ".join(f'{p}="<value>"' for p in params) if params else ""
+sample_call = f'result = await {name}({sample_args})'
+
+body_snippet = textwrap.shorten(body, width=200, placeholder=" …") if body else "(body unavailable)"
+user_doc     = f"\n\n    Q docstring: {doc.strip()}" if doc.strip() else ""
+
+return textwrap.dedent(f"""\
+    Invoke the KDB+ function `{name}` on the connected KDB+/Q server.{user_doc}
+
+    This tool executes the Q expression:
+        {name}[{"; ".join(params)}]
+    and returns the result as a JSON-serialised string.
+
+    Parameters
+    ----------
+```
+
+{textwrap.indent(param_block, “    “)}
+
+```
+    Returns
+    -------
+    str
+        JSON-encoded result from KDB+.  Tables are returned as arrays of
+        objects; dictionaries as JSON objects; atoms as scalar JSON values.
+
+    Q function body (excerpt)
+    -------------------------
+        {body_snippet}
+
+    Sample MCP call
+    ---------------
+        {sample_call}
+
+    Keywords
+    --------
+        kdb, q, kdb+, {name}, query, time-series, analytics
+    """)
+```
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Dynamic tool factory
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+def register_kdb_tool(mcp: FastMCP, kdb: KDBConnection, fn_meta: Dict[str, str]) -> None:
+“”“Create and register a FastMCP tool for a single KDB function.”””
+name   = fn_meta[“name”]
+params = fn_meta[“params”]
+doc    = build_docstring(fn_meta)
+
+```
+if not params:
+    # ── zero-arg function ────────────────────────────────────────────────
+    @mcp.tool(name=name, description=doc)
+    def _tool_no_args() -> str:
+        log.info("Calling KDB function: %s[]", name)
+        result = kdb.query(f"{name}[]")
+        return _serialise_result(result)
+
+else:
+    # ── parameterised function ───────────────────────────────────────────
+    # We build a dynamic function with the correct signature so FastMCP
+    # can surface proper parameter names in the tool schema.
+    param_str  = ", ".join(params)
+    typed_str  = ", ".join(f'{p}: str = ""' for p in params)
+    q_args_str = "; ".join([f"`$string {p}" if True else p for p in params])
+
+    fn_source = textwrap.dedent(f"""\
+        def _tool({typed_str}) -> str:
+            args_q = "; ".join([
+                (f'`$string "{{v}}"' if isinstance(v, str) else str(v))
+                for v in [{param_str}]
+            ])
+            expr = f"{name}[{{args_q}}]"
+            log.info("Calling KDB: %s", expr)
+            result = kdb.query(expr)
+            return _serialise_result(result)
+    """)
+
+    local_ns: Dict[str, Any] = {
+        "log": log,
+        "kdb": kdb,
+        "_serialise_result": _serialise_result,
+    }
+    exec(fn_source, local_ns)  # noqa: S102 – controlled dynamic code
+    tool_fn = local_ns["_tool"]
+    tool_fn.__name__ = name
+    tool_fn.__doc__  = doc
+
+    mcp.tool(name=name, description=doc)(tool_fn)
+
+log.info("Registered MCP tool: %s (params=%s)", name, params)
+```
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Server prompt
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+SERVER_PROMPT = textwrap.dedent(”””  
+# KDB+ Analytics MCP Server
+
+```
+## Purpose
+This server exposes **KDB+/Q functions** as MCP tools, allowing any MCP-compatible
+LLM or agent to query a live KDB+ time-series database without writing raw Q code.
+
+## When to use this server
+| Scenario | Use this server? |
+|---|---|
+| Query tick data, OHLCV bars, or order-book snapshots | ✅ Yes |
+| Run pre-built analytics (VWAP, TWA, rolling vol, etc.) | ✅ Yes |
+| Fetch reference data registered in KDB+ | ✅ Yes |
+| Ad-hoc Q scripting / schema changes | ❌ Use direct KDB+ access |
+| Non-time-series relational queries | ❌ Consider SQL server |
+
+## Key Concepts
+- Every tool corresponds 1-to-1 with a **public lambda** in the connected KDB+ namespace.
+- Arguments are passed as **strings**; the server handles type coercion via Q's `$` operator.
+- Results are returned as **JSON** (tables → array-of-objects, dicts → objects, atoms → scalars).
+
+## Keywords
+kdb, kdb+, q language, time-series, tick data, market data, ohlcv, vwap, analytics,
+order book, financial data, real-time, historical, quantitative finance
+
+## Sample Interaction Flow
+1. Ask the LLM: *"Get the last 100 trades for AAPL"*
+2. LLM selects the appropriate tool (e.g. `getTrades`)
+3. Tool is called: `getTrades(sym="AAPL", n="100")`
+4. KDB+ executes `getTrades[`$string "AAPL"; `$string "100"]`
+5. Result JSON is returned and the LLM formats it for the user.
+
+## Connection Info
+Connected to KDB+ at **{host}:{port}** (namespace: `.`)
+
+## Available Tools
+Tools are discovered dynamically at startup.  Run `list_tools()` or inspect the
+tool registry to see what is currently available.
+```
+
+“””)
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+# CLI / Entry point
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+p = argparse.ArgumentParser(description=“Dynamic KDB+ FastMCP Server”)
+p.add_argument(”–host”,     default=os.getenv(“KDB_HOST”, “localhost”))
+p.add_argument(”–port”,     type=int, default=int(os.getenv(“KDB_PORT”, “5000”)))
+p.add_argument(”–user”,     default=os.getenv(“KDB_USER”, “”))
+p.add_argument(”–password”, default=os.getenv(“KDB_PASSWORD”, “”))
+p.add_argument(”–transport”,choices=[“stdio”, “sse”], default=“stdio”,
+help=“MCP transport (stdio for Claude Desktop, sse for HTTP)”)
+p.add_argument(”–reload-interval”, type=int, default=0,
+help=“Re-introspect KDB+ every N seconds (0 = no reload)”)
+return p.parse_args()
+
+def build_server(host: str, port: int, user: str, password: str) -> FastMCP:
+“”“Connect to KDB+, introspect, and return a fully-wired FastMCP server.”””
+
+```
+kdb = KDBConnection(host=host, port=port, user=user, password=password)
+kdb.connect()
+
+# ── Server + prompt ───────────────────────────────────────────────────────
+mcp = FastMCP(
+    name="kdb-mcp-server",
+    instructions=SERVER_PROMPT.format(host=host, port=port),
+)
+
+# ── Built-in utility tools ─────────────────────────────────────────────────
+@mcp.tool(
+    name="kdb_raw_query",
+    description=textwrap.dedent("""\
+        Execute an arbitrary Q expression on the KDB+ server and return the result as JSON.
+
+        Use this as an escape-hatch when no dedicated tool matches your query.
+
+        Parameters
+        ----------
+        expr (str): Any valid Q/KDB+ expression, e.g. 'select from trade where sym=`AAPL'.
+
+        Returns
+        -------
+        str
+            JSON-encoded result.
+
+        Keywords
+        --------
+            kdb, raw, q expression, ad-hoc, custom query
+
+        Sample call
+        -----------
+            result = await kdb_raw_query(expr="count trade")
+    """),
+)
+def kdb_raw_query(expr: str) -> str:
+    log.info("Raw KDB query: %s", expr)
+    result = kdb.query(expr)
+    return _serialise_result(result)
+
+@mcp.tool(
+    name="kdb_list_functions",
+    description=textwrap.dedent("""\
+        List all public KDB+ functions currently available as MCP tools.
+
+        Returns
+        -------
+        str
+            JSON array of objects with keys: name, params, doc.
+
+        Keywords
+        --------
+            kdb, list, functions, tools, available, discover
+
+        Sample call
+        -----------
+            result = await kdb_list_functions()
+    """),
+)
+def kdb_list_functions() -> str:
+    fns = introspect_functions(kdb)
+    summary = [{"name": f["name"], "params": f["params"], "doc": f["doc"]} for f in fns]
+    return json.dumps(summary, indent=2)
+
+@mcp.tool(
+    name="kdb_table_schema",
+    description=textwrap.dedent("""\
+        Return the column names and types for a KDB+ table.
+
+        Parameters
+        ----------
+        table (str): Name of the table in the connected KDB+ namespace.
+
+        Returns
+        -------
+        str
+            JSON object mapping column names to Q type codes.
+
+        Keywords
+        --------
+            kdb, schema, table, columns, types, metadata
+
+        Sample call
+        -----------
+            result = await kdb_table_schema(table="trade")
+    """),
+)
+def kdb_table_schema(table: str) -> str:
+    result = kdb.query(f"meta {table}")
+    return _serialise_result(result)
+
+# ── Dynamically register KDB functions ────────────────────────────────────
+functions = introspect_functions(kdb)
+if not functions:
+    log.warning("No public KDB functions found – only built-in tools registered.")
+for fn_meta in functions:
+    try:
+        register_kdb_tool(mcp, kdb, fn_meta)
+    except Exception as exc:
+        log.error("Failed to register tool %s: %s", fn_meta["name"], exc)
+
+log.info(
+    "FastMCP server ready with %d tool(s) (%d from KDB+, 3 built-in).",
+    len(functions) + 3, len(functions),
+)
+return mcp
+```
+
+def main() -> None:
+args = parse_args()
+mcp  = build_server(args.host, args.port, args.user, args.password)
+
+```
+if args.transport == "sse":
+    mcp.run(transport="sse")
+else:
+    mcp.run(transport="stdio")
+```
+
+if **name** == “**main**”:
+main()
