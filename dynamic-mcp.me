@@ -1,0 +1,140 @@
+# Dynamic KDB+ FastMCP Server
+
+Connect any **KDB+/Q** instance to the Model Context Protocol.  
+On startup the server introspects the live KDB+ namespace, discovers every
+public lambda, and **auto-generates a FastMCP tool** for it – complete with:
+
+- Rich docstring (parameters, return format, Q body excerpt, keywords)
+- Proper parameter names surfaced in the MCP tool schema
+- 3 built-in utility tools always available
+- A server-level **prompt** that tells the LLM what the server does, when to
+  use it, sample calls, and key concepts
+
+-----
+
+## Quick Start
+
+```bash
+pip install -r requirements.txt
+
+# Against a real KDB+ instance
+python kdb_mcp_server.py --host localhost --port 5000
+
+# Demo / no KDB+ needed
+python kdb_mcp_demo.py          # stdio (Claude Desktop)
+python kdb_mcp_demo.py --sse    # SSE  (browser / curl)
+```
+
+-----
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│              kdb_mcp_server.py                  │
+│                                                 │
+│  1. KDBConnection.connect()                     │
+│        │                                        │
+│  2. introspect_functions()  ──── Q introspect   │
+│        │   returns [{name, params, body, doc}]  │
+│        ▼                                        │
+│  3. for each function:                          │
+│       build_docstring(fn_meta)                  │
+│       register_kdb_tool(mcp, kdb, fn_meta)      │
+│        │                                        │
+│  4. + 3 built-in tools                          │
+│       kdb_raw_query                             │
+│       kdb_list_functions                        │
+│       kdb_table_schema                          │
+│        │                                        │
+│  5. mcp.run(transport="stdio" | "sse")          │
+└─────────────────────────────────────────────────┘
+```
+
+-----
+
+## Built-in Tools
+
+|Tool                     |Purpose                                    |
+|-------------------------|-------------------------------------------|
+|`kdb_raw_query(expr)`    |Run any Q expression ad-hoc                |
+|`kdb_list_functions()`   |Discover all available tools + their params|
+|`kdb_table_schema(table)`|Get column names & Q type codes for a table|
+
+-----
+
+## Dynamically Generated Tools
+
+For every public lambda in the KDB+ namespace the server creates a tool:
+
+```
+getTrades(sym, n) → str (JSON)
+getVWAP(sym, date) → str (JSON)
+getOHLCV(sym, date) → str (JSON)
+listSymbols() → str (JSON)
+...
+```
+
+Each tool’s docstring contains:
+
+- Plain-English description (from Q function’s doc comment if present)
+- Parameter table with types
+- Q body excerpt
+- Sample MCP call
+- Keywords for LLM routing
+
+-----
+
+## Claude Desktop Integration
+
+Add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "kdb": {
+      "command": "python",
+      "args": ["/path/to/kdb_mcp_server.py",
+               "--host", "localhost",
+               "--port", "5000"],
+      "env": {
+        "KDB_USER": "myuser",
+        "KDB_PASSWORD": "secret"
+      }
+    }
+  }
+}
+```
+
+-----
+
+## Environment Variables
+
+|Variable      |Default    |Description  |
+|--------------|-----------|-------------|
+|`KDB_HOST`    |`localhost`|KDB+ hostname|
+|`KDB_PORT`    |`5000`     |KDB+ port    |
+|`KDB_USER`    |*(empty)*  |KDB+ username|
+|`KDB_PASSWORD`|*(empty)*  |KDB+ password|
+
+-----
+
+## Sample LLM Interaction
+
+> **User:** What was Apple’s VWAP yesterday?
+
+> **LLM → MCP:** `getVWAP(sym="AAPL", date="2024-01-15")`
+
+> **KDB+:** `getVWAP[`$string “AAPL”; `$string "2024-01-15"]`
+
+> **Result:** `{"sym": "AAPL", "date": "2024-01-15", "vwap": 185.42}`
+
+> **LLM:** Apple’s VWAP on January 15 2024 was **$185.42**.
+
+-----
+
+## Extending
+
+To add a new tool that doesn’t map to a KDB function, simply add a
+`@mcp.tool(...)` decorated function inside `build_server()` in
+`kdb_mcp_server.py`.
