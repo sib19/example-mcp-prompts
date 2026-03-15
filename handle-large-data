@@ -1,0 +1,255 @@
+## “””
+kdb_mcp_large_data.py
+
+MCP tool patterns for handling millions of KDB+ records.
+Strategy: Transform, Don’t Transfer — aggregate/sample/page in KDB+, never dump raw rows.
+“””
+
+from uuid import uuid4
+from fastmcp import FastMCP
+import pykx as kx
+
+mcp = FastMCP(“kdb-large-data”)
+kdb = kx.EmbeddedQ()
+
+MAX_ROWS = 2000  # hard ceiling for any raw row return
+CACHE: dict = {}  # in-memory result store for chunked access
+
+# —————————————————————————
+
+# Guard: inject row cap into any raw select
+
+# —————————————————————————
+
+def safe_query(q_str: str) -> dict:
+“”“Wrap any Q expression with a hard row limit.”””
+limited = f”({MAX_ROWS} sublist {q_str})”
+result = kdb.q(limited)
+rows = result.pd()
+was_truncated = len(rows) == MAX_ROWS
+return {
+“data”: rows.to_dict(orient=“records”),
+“truncated”: was_truncated,
+“note”: f”Capped at {MAX_ROWS} rows” if was_truncated else None,
+}
+
+# —————————————————————————
+
+# Tier 1 — Aggregation (preferred, no raw rows)
+
+# —————————————————————————
+
+@mcp.tool()
+def analyze_trades(sym: str, date: str) -> dict:
+“””
+Return summary statistics for a symbol on a given date.
+Never returns raw rows — all aggregation happens inside KDB+.
+
+```
+Args:
+    sym:  Instrument symbol, e.g. 'AAPL'
+    date: Date string in KDB+ format, e.g. '2024.01.15'
+"""
+result = kdb.q(f"""
+    select
+        total_trades: count i,
+        total_volume: sum size,
+        vwap:         size wavg price,
+        price_range:  (max price) - min price,
+        first_time:   first time,
+        last_time:    last time
+    from trades
+    where date={date}, sym=`{sym}
+""")
+return result.pd().to_dict(orient="records")
+```
+
+@mcp.tool()
+def summarize_table(table: str) -> dict:
+“””
+Return row count, column schema, and numeric column stats for any table.
+
+```
+Args:
+    table: KDB+ table name
+"""
+row_count = kdb.q(f"count {table}").py()
+schema = kdb.q(f"meta {table}").pd().to_dict()
+stats = kdb.q(f"""
+    {{[t]
+        cols_ : exec c from meta t where t in "hijefpmdznuvts";
+        :{{ [c] (c; (min; max; avg; count) @\\: ?[t; (); (); c]) }} each cols_
+    }}[{table}]
+""").py()
+return {
+    "table": table,
+    "row_count": row_count,
+    "schema": schema,
+    "numeric_stats": stats,
+}
+```
+
+# —————————————————————————
+
+# Tier 2 — Sampling (small, inspectable slices)
+
+# —————————————————————————
+
+@mcp.tool()
+def sample_rows(table: str, n: int = 20, mode: str = “first”) -> dict:
+“””
+Return a small sample of rows from a table.
+
+```
+Args:
+    table: KDB+ table name
+    n:     Number of rows to return (max 1000)
+    mode:  'first' | 'last' | 'random'
+"""
+if n > 1000:
+    raise ValueError("Max sample size is 1000 rows")
+
+if mode == "first":
+    q_str = f"{n} # {table}"
+elif mode == "last":
+    q_str = f"neg[{n}] # {table}"
+elif mode == "random":
+    q_str = f"{n} ? {table}"
+else:
+    raise ValueError("mode must be 'first', 'last', or 'random'")
+
+result = kdb.q(q_str).pd()
+return {
+    "table": table,
+    "mode": mode,
+    "returned_rows": len(result),
+    "data": result.to_dict(orient="records"),
+}
+```
+
+# —————————————————————————
+
+# Tier 3 — Filtered query (predicate pushed to KDB+)
+
+# —————————————————————————
+
+@mcp.tool()
+def query_filtered(table: str, where_clause: str, max_rows: int = 500) -> dict:
+“””
+Run a filtered select with a where clause — row cap enforced.
+
+```
+Args:
+    table:        KDB+ table name
+    where_clause: KDB+ where clause, e.g. 'date=2024.01.15, sym=`AAPL'
+    max_rows:     Return at most this many rows (hard cap: MAX_ROWS)
+"""
+cap = min(max_rows, MAX_ROWS)
+q_str = f"({cap} sublist select from {table} where {where_clause})"
+result = kdb.q(q_str).pd()
+return {
+    "query": q_str,
+    "returned_rows": len(result),
+    "capped_at": cap,
+    "data": result.to_dict(orient="records"),
+}
+```
+
+# —————————————————————————
+
+# Pagination — cursor-based paging through large result sets
+
+# —————————————————————————
+
+@mcp.tool()
+def query_table(table: str, page: int = 0, page_size: int = 500) -> dict:
+“””
+Page through a table. Use has_more to decide whether to fetch next page.
+
+```
+Args:
+    table:     KDB+ table name
+    page:      Zero-based page index
+    page_size: Rows per page (max 1000)
+"""
+if page_size > 1000:
+    raise ValueError("Max page_size is 1000")
+
+q_str = f"({page_size} # {page * page_size} _ select from {table})"
+result = kdb.q(q_str).pd()
+total = kdb.q(f"count {table}").py()
+
+return {
+    "table": table,
+    "page": page,
+    "page_size": page_size,
+    "returned_rows": len(result),
+    "total_rows": total,
+    "total_pages": -(-total // page_size),  # ceiling division
+    "has_more": (page + 1) * page_size < total,
+    "data": result.to_dict(orient="records"),
+}
+```
+
+# —————————————————————————
+
+# Chunked export — run query once, store result, LLM fetches via resource URI
+
+# —————————————————————————
+
+@mcp.tool()
+def export_query(q_str: str) -> dict:
+“””
+Execute a Q expression, cache the result, and return a resource URI.
+Use get_result_chunk to page through the data.
+
+```
+Args:
+    q_str: Any valid Q expression
+"""
+result = safe_query(q_str)
+key = f"query_{uuid4().hex}"
+CACHE[key] = result["data"]
+return {
+    "resource_uri": f"kdb://results/{key}",
+    "row_count": len(result["data"]),
+    "truncated": result["truncated"],
+    "note": result["note"],
+}
+```
+
+@mcp.tool()
+def get_result_chunk(resource_key: str, offset: int = 0, limit: int = 500) -> dict:
+“””
+Fetch a chunk from a previously exported query result.
+
+```
+Args:
+    resource_key: Key returned by export_query (strip 'kdb://results/' prefix)
+    offset:       Row offset
+    limit:        Number of rows to return
+"""
+key = resource_key.removeprefix("kdb://results/")
+if key not in CACHE:
+    raise KeyError(f"No cached result for key: {key}")
+
+rows = CACHE[key]
+chunk = rows[offset: offset + limit]
+return {
+    "resource_key": key,
+    "offset": offset,
+    "limit": limit,
+    "returned_rows": len(chunk),
+    "has_more": offset + limit < len(rows),
+    "data": chunk,
+}
+```
+
+# —————————————————————————
+
+# Entry point
+
+# —————————————————————————
+
+if **name** == “**main**”:
+mcp.run()
