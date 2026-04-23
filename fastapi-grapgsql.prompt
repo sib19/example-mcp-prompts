@@ -1,0 +1,251 @@
+You are building a production-grade FastAPI microservice that acts as a GraphQL client 
+gateway. It will be containerised with Docker and deployed on Kubernetes. Follow these 
+architectural requirements precisely.
+
+---
+
+## PROJECT OVERVIEW
+
+Build a FastAPI service that:
+- Connects to one or more external GraphQL endpoints defined in config files
+- Sends query/mutation payloads via HTTP POST
+- Has a pluggable endpoint wrapper pattern so new GraphQL sources can be added with 
+  minimal boilerplate
+- Uses a centralized connection manager and structured logger
+- Is production-ready for Docker + Kubernetes
+
+---
+
+## DIRECTORY STRUCTURE
+
+Create this layout:
+
+app/
+├── main.py                  # FastAPI app factory, lifespan startup/shutdown
+├── config/
+│   ├── settings.py          # Pydantic BaseSettings (reads from env + config files)
+│   └── endpoints.yaml       # GraphQL endpoint definitions (URL, headers, timeout)
+├── core/
+│   ├── connection_manager.py  # httpx.AsyncClient pool, per-endpoint sessions
+│   ├── logger.py              # Structlog or loguru structured JSON logger
+│   └── exceptions.py          # Custom HTTP + GraphQL error types
+├── graphql_client/
+│   ├── base_client.py        # Abstract base: execute_query(), execute_mutation()
+│   ├── endpoint_registry.py  # Registry pattern: register/lookup endpoint clients
+│   └── endpoints/
+│       ├── __init__.py
+│       ├── example_api.py    # Concrete client for "example" GraphQL source
+│       └── another_api.py    # Second source - demonstrate the pluggable pattern
+├── routers/
+│   ├── health.py             # /health and /ready endpoints for K8s probes
+│   └── query.py              # POST /graphql/{endpoint_name} route
+├── models/
+│   ├── request.py            # GraphQLRequest: query, variables, operation_name
+│   └── response.py           # GraphQLResponse wrapper with metadata
+├── middleware/
+│   └── logging_middleware.py # Request ID injection, timing, structured access logs
+├── Dockerfile
+├── docker-compose.yml
+└── k8s/
+    ├── deployment.yaml
+    ├── service.yaml
+    ├── configmap.yaml        # Non-secret config mounted into container
+    └── secret.yaml           # Template for API keys/tokens (values redacted)
+
+---
+
+## DETAILED REQUIREMENTS
+
+### 1. Config System (config/settings.py + endpoints.yaml)
+
+- Use Pydantic `BaseSettings` with `model_config = SettingsConfigDict(env_file=".env")`
+- Support overriding any setting via environment variable (K8s ConfigMap/Secret)
+- `endpoints.yaml` schema:
+
+  endpoints:
+    example_api:
+      url: "https://api.example.com/graphql"
+      timeout_seconds: 30
+      headers:
+        Content-Type: "application/json"
+        Authorization: "Bearer ${EXAMPLE_API_TOKEN}"   # env var interpolation
+    another_api:
+      url: "https://other.example.com/graphql"
+      timeout_seconds: 15
+      headers:
+        X-Api-Key: "${ANOTHER_API_KEY}"
+
+- Load and parse this YAML in settings.py; interpolate ${VAR} from environment
+- Expose as `settings.endpoints: dict[str, EndpointConfig]`
+
+### 2. Connection Manager (core/connection_manager.py)
+
+- Maintain one `httpx.AsyncClient` per named endpoint (not one global client)
+- Clients created at app startup via FastAPI lifespan context manager
+- Enforce per-endpoint timeout from config
+- Expose: `get_client(endpoint_name: str) -> httpx.AsyncClient`
+- On shutdown, call `await client.aclose()` for each client
+- Handle `httpx.ConnectError`, `httpx.TimeoutException` → raise `ConnectionError` 
+  from core/exceptions.py
+
+### 3. Logger (core/logger.py)
+
+- Use `structlog` with JSON rendering in production, pretty console in dev
+- Inject `request_id` (UUID per request) into every log record via contextvars
+- Log levels controlled by `LOG_LEVEL` env var
+- Helper: `get_logger(name: str)` returns a bound logger
+- Log all GraphQL errors returned in response body (not just HTTP errors)
+
+### 4. Base GraphQL Client (graphql_client/base_client.py)
+
+- Abstract class `BaseGraphQLClient`:
+
+  class BaseGraphQLClient(ABC):
+      endpoint_name: str                      # must set in subclass
+
+      async def execute(
+          self,
+          query: str,
+          variables: dict | None = None,
+          operation_name: str | None = None,
+      ) -> dict:
+          ...  # sends POST, handles errors, returns data dict
+
+- `execute()` should:
+  1. Get client from ConnectionManager
+  2. POST `{"query": ..., "variables": ..., "operationName": ...}`
+  3. Raise `GraphQLError` if response contains `errors` key
+  4. Raise `HTTPError` for non-2xx responses
+  5. Return `response["data"]`
+
+### 5. Endpoint Registry (graphql_client/endpoint_registry.py)
+
+- Simple registry dict: `_registry: dict[str, BaseGraphQLClient] = {}`
+- Decorator for registration:
+
+  @register_endpoint("example_api")
+  class ExampleApiClient(BaseGraphQLClient):
+      ...
+
+- Function: `get_endpoint_client(name: str) -> BaseGraphQLClient`
+- Raise `EndpointNotFoundError` if name not in registry
+
+### 6. Concrete Endpoint Clients (graphql_client/endpoints/)
+
+- Each file defines ONE client class registered with `@register_endpoint`
+- May define typed query helper methods on top of `execute()`:
+
+  class ExampleApiClient(BaseGraphQLClient):
+      endpoint_name = "example_api"
+
+      async def get_user(self, user_id: str) -> dict:
+          query = """
+            query GetUser($id: ID!) {
+              user(id: $id) { id name email }
+            }
+          """
+          return await self.execute(query, variables={"id": user_id})
+
+- These typed helpers are OPTIONAL; raw `execute()` always works too
+
+### 7. Router (routers/query.py)
+
+- `POST /graphql/{endpoint_name}` accepts `GraphQLRequest` body
+- Looks up client via registry, calls `execute()`, returns `GraphQLResponse`
+- Endpoint name validated against registered clients (422 if unknown)
+- Full request/response logged with request_id and timing
+
+### 8. Health Endpoints (routers/health.py)
+
+- `GET /health` → 200 `{"status": "ok"}` (liveness probe)
+- `GET /ready` → checks each endpoint client can be resolved; 200 or 503
+
+### 9. Models (models/)
+
+  # request.py
+  class GraphQLRequest(BaseModel):
+      query: str
+      variables: dict | None = None
+      operation_name: str | None = None
+
+  # response.py  
+  class GraphQLResponse(BaseModel):
+      data: dict | None
+      errors: list | None = None
+      endpoint: str
+      duration_ms: float
+      request_id: str
+
+### 10. Middleware (middleware/logging_middleware.py)
+
+- Starlette `BaseHTTPMiddleware`
+- Generate UUID request_id, store in ContextVar
+- Log: method, path, status_code, duration_ms, request_id
+- Add `X-Request-ID` response header
+
+### 11. Dockerfile
+
+- Multi-stage build: builder (install deps) + runtime (slim image)
+- Base: `python:3.12-slim`
+- Non-root user `appuser`
+- `HEALTHCHECK` using `/health` endpoint
+- Copy only necessary files into runtime stage
+
+### 12. docker-compose.yml
+
+- Service: `graphql-gateway`
+- Mounts: `.env` file, `app/config/endpoints.yaml`
+- Ports: 8000:8000
+- Env: LOG_LEVEL, plus stubs for API tokens
+
+### 13. Kubernetes Manifests (k8s/)
+
+- `deployment.yaml`:
+  - 2 replicas
+  - Resource requests/limits (100m/256Mi → 500m/512Mi)
+  - Liveness probe: GET /health, initial delay 10s
+  - Readiness probe: GET /ready, initial delay 5s
+  - envFrom: configMapRef + secretRef
+  
+- `configmap.yaml`: LOG_LEVEL, APP_ENV, any non-secret config
+
+- `secret.yaml`: Template with placeholder values for API tokens
+
+- `service.yaml`: ClusterIP on port 80 → 8000
+
+---
+
+## DEPENDENCIES
+
+Use these in requirements.txt:
+
+fastapi>=0.111
+uvicorn[standard]>=0.29
+httpx>=0.27
+pydantic>=2.7
+pydantic-settings>=2.2
+pyyaml>=6.0
+structlog>=24.1
+python-dotenv>=1.0
+
+---
+
+## CODING STANDARDS
+
+- Python 3.12, full type hints throughout
+- Async everywhere (no sync blocking calls)
+- Pydantic v2 models only
+- All errors caught and re-raised as typed exceptions from core/exceptions.py
+- No hardcoded URLs, tokens, or timeouts anywhere — all from config
+- Each module has a module-level logger: `log = get_logger(__name__)`
+- Include docstrings on all public classes and methods
+- Add a README.md covering: local dev setup, adding a new endpoint in 3 steps, 
+  env vars reference, K8s deployment steps
+
+---
+
+## DELIVERABLES
+
+Generate ALL files listed in the directory structure above with full working code.
+Start with: settings.py → logger.py → connection_manager.py → base_client.py → 
+endpoint_registry.py → then the rest in dependency order.
